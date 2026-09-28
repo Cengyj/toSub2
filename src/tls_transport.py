@@ -12,7 +12,8 @@ from typing import get_args
 from urllib.parse import urljoin, urlparse
 
 try:
-    from curl_cffi import requests
+    from curl_cffi import CurlOpt, requests
+    from curl_cffi.requests.exceptions import ImpersonateError
     from curl_cffi.requests.impersonate import BrowserTypeLiteral
     IMPORT_ERROR = None
 except Exception as error:  # pragma: no cover - exercised on missing local dependency
@@ -208,18 +209,25 @@ class Worker:
         message = str(error or "")
         return "impersonat" in message.lower() and "not supported" in message.lower()
 
-    def _request_with_profile_fallback(self, method, url, headers, body_bytes, timeout_ms):
+    def _request_with_profile_fallback(
+        self, method, url, headers, body_bytes, timeout_ms, default_headers=None, single_attempt=False
+    ):
+        request_options = {
+            "headers": headers,
+            "data": body_bytes,
+            "timeout": timeout_ms / 1000,
+            "allow_redirects": False,
+        }
+        if isinstance(default_headers, bool):
+            request_options["default_headers"] = default_headers
         try:
-            return self.session.request(
-                method,
-                url,
-                headers=headers,
-                data=body_bytes,
-                timeout=timeout_ms / 1000,
-                allow_redirects=False,
-            )
+            return self._perform_request(method, url, request_options, single_attempt)
         except Exception as error:
-            if not self._is_unsupported_impersonate(error):
+            # curl_cffi raises ImpersonateError while building curl options, before
+            # curl.perform sends anything. One-shot calls permit only that fallback.
+            if not self._is_unsupported_impersonate(error) or (
+                single_attempt and not isinstance(error, ImpersonateError)
+            ):
                 raise
 
             original_profile = self.impersonate
@@ -234,23 +242,36 @@ class Worker:
                         allow_fallback=False,
                         verify_tls=self.verify_tls,
                     )
-                    response = self.session.request(
-                        method,
-                        url,
-                        headers=headers,
-                        data=body_bytes,
-                        timeout=timeout_ms / 1000,
-                        allow_redirects=False,
-                    )
+                    response = self._perform_request(method, url, request_options, single_attempt)
                     sys.stderr.write(
                         f"[tls] 指纹 {original_profile} 不受当前 curl_cffi 支持，已降级为 {profile}\n"
                     )
                     return response
                 except Exception as fallback_error:
                     last_error = fallback_error
-                    if not self._is_unsupported_impersonate(fallback_error):
+                    if not self._is_unsupported_impersonate(fallback_error) or (
+                        single_attempt and not isinstance(fallback_error, ImpersonateError)
+                    ):
                         raise
             raise last_error
+
+    def _perform_request(self, method, url, request_options, single_attempt):
+        if not single_attempt:
+            return self.session.request(method, url, **request_options)
+        # libcurl may replay even a POST when a reused connection dies. Use a fresh
+        # connection for this mutation and close it afterwards, retaining cookies.
+        # Worker messages execute serially; restore options for all later callers.
+        session = self.session
+        previous_options = getattr(session, "curl_options", {})
+        session.curl_options = {
+            **previous_options,
+            CurlOpt.FRESH_CONNECT: 1,
+            CurlOpt.FORBID_REUSE: 1,
+        }
+        try:
+            return session.request(method, url, **request_options)
+        finally:
+            session.curl_options = previous_options
 
     def request(self, message):
         if self.session is None:
@@ -258,16 +279,25 @@ class Worker:
 
         method = str(message.get("method") or "GET").upper()
         url = str(message.get("url") or "")
+        omit_headers = {
+            name.strip().lower() for name in message.get("omitHeaders", [])
+            if isinstance(name, str) and name.strip()
+        } if isinstance(message.get("omitHeaders", []), list) else set()
         headers = {}
         for pair in message.get("headers") or []:
-            if isinstance(pair, list) and len(pair) == 2:
+            if isinstance(pair, list) and len(pair) == 2 and str(pair[0]).lower() not in omit_headers:
                 headers[str(pair[0])] = str(pair[1])
+        # None means omit in curl_cffi; empty strings instead send an empty header.
+        for name in omit_headers:
+            headers[name] = None
 
         body = message.get("body")
         body_bytes = base64.b64decode(body) if body else None
         timeout_ms = max(1, int(message.get("timeoutMs") or 30000))
         response = self._request_with_profile_fallback(
-            method, url, headers, body_bytes, timeout_ms
+            method, url, headers, body_bytes, timeout_ms,
+            default_headers=message.get("defaultHeaders"),
+            single_attempt=message.get("singleAttempt") is True,
         )
         header_items = list(response.headers.multi_items()) if hasattr(response.headers, "multi_items") else list(response.headers.items())
         cookies = []

@@ -1,55 +1,59 @@
-# 本机部署说明
+# 部署与服务管理
 
-部署日期：2026-09-21。
+## Windows 后台服务
 
-- 控制台：http://127.0.0.1:4399/
-- 运行方式：当前 Windows 用户的 PM2 后台进程 `tosub2`，异常退出后自动重启；当前用户登录时由计划任务 `toSub2 PM2 Resurrect` 自动恢复，另有 `toSub2 PM2 Watchdog` 每 5 分钟检查并恢复 PM2 应用列表。
-- Node.js：22.23.2。
-- Python：项目 `.venv` 中的 3.13.9，已安装 `curl_cffi==0.15.0`。
-- 数据目录：`D:\Downloads\toSub2-1.7.1\tmp\chatgpt-onboarding-console`。
-- 日志目录：`C:\Users\Ceng\.pm2\logs`。
-
-PM2 配置会优先使用 `TOSUB2_PYTHON` 环境变量，否则自动使用项目的 `.venv`。
-
-## 管理命令
-
-在 PowerShell 中进入项目目录后执行：
+在项目目录运行以下命令。先安装 Node.js 和包含 `pythonw.exe` 的 Python，再创建项目虚拟环境：
 
 ```powershell
-Set-Location -LiteralPath 'D:\Downloads\toSub2-1.7.1'
-npm.cmd run daemon:start     # 启动
-npm.cmd run daemon:restart   # 重启
-npm.cmd run daemon:stop      # 停止
-npm.cmd run daemon:logs      # 查看日志，Ctrl+C 退出日志查看
-pm2.cmd status              # 查看运行状态
+npm.cmd ci
+python -m venv .venv
+& ./.venv/Scripts/python.exe -m pip install -r requirements.txt
+npm.cmd run deploy:windows
 ```
 
-PM2 进程列表已保存。已配置当前用户登录触发的 Windows 计划任务 `toSub2 PM2 Resurrect`，以及每 5 分钟运行的 `toSub2 PM2 Watchdog`；两者执行 `pm2 resurrect` 恢复已保存的应用列表。电脑重启后登录当前用户即可自动恢复；若任务被禁用或删除，可重新执行 `npm.cmd run daemon:start`，再按需重新注册这些计划任务。
+安装脚本注册当前用户的计划任务 `toSub2 Persistent Server`，由 `scripts/windows-daemon.py` 启动无窗口 Node.js 服务。默认控制台为 `http://127.0.0.1:4399/`；用户登录后自动启动，异常退出后自动恢复。安装目录写入本地配置，移动目录前请停止旧任务，再重新安装。
 
-## 验证结果
+- 本地部署配置：`%LOCALAPPDATA%/toSub2/deployment.json`。
+- 服务日志：`%LOCALAPPDATA%/toSub2/logs`。
+- Windows 加密凭据：`%LOCALAPPDATA%/toSub2/credentials`，由当前用户 DPAPI 保护。
+- 账号任务及授权输出默认位于项目的 `tmp/chatgpt-onboarding-console`。
 
-首页、前端 JSX 转换资源、初始化接口、任务列表接口、监控状态接口均正常，浏览器已成功渲染控制台。
+这些目录包含运行状态或账号资料，不应提交到 Git。原始 HAR 抓包也不应上传。
 
-源文件语法检查通过；TLS、凭据存储、短信平台、任务锁、控制台、短信控制台、协议流程、密码与 2FA 流程共 8 项测试通过。
-
-原有 `console-restore-shutdown-smoke` 测试在 Windows 上失败：测试用 `SIGTERM` 终止子进程后期待退出码 0，但 Windows 返回 null。PM2 在 Windows 上也会强制结束进程，因此停止或重启服务前，应先在页面停止正在进行的任务。
-
-若需重新执行项目检查：
+## 查看、停止与启动
 
 ```powershell
-$env:TOSUB2_PYTHON = (Resolve-Path -LiteralPath '.\.venv\Scripts\python.exe').Path
+$taskName = 'toSub2 Persistent Server'
+Get-ScheduledTask -TaskName $taskName
+Get-ScheduledTaskInfo -TaskName $taskName
+
+# 等待当前账号操作结束后，停止服务及其自动恢复。
+Disable-ScheduledTask -TaskName $taskName
+Stop-ScheduledTask -TaskName $taskName
+
+# 启动服务并恢复自动运行。
+Enable-ScheduledTask -TaskName $taskName
+Start-ScheduledTask -TaskName $taskName
+
+# 查看日志，按 Ctrl+C 结束查看。
+Get-Content -LiteralPath (Join-Path $env:LOCALAPPDATA 'toSub2/logs/console-error.log') -Tail 30 -Wait
+```
+
+更新代码和依赖后，按“停止”再“启动”的顺序重启，并刷新浏览器页面。重置 2FA 等安全操作执行中请先等待其完成，再重启服务。
+
+同一端口只运行一个服务。已安装计划任务时，不要同时启动 `npm run dev` 或另一个 PM2 实例。脚本发现同名任务或占用端口时会拒绝重复安装。
+
+## 前台运行或 PM2
+
+调试时可使用 `npm run dev`，关闭对应终端即结束前台服务。项目也保留 `ecosystem.config.cjs` 和 `daemon:start / daemon:restart / daemon:stop / daemon:logs` 脚本；使用 PM2 时需自行安装、配置 PM2，并避免与 Windows 计划任务重复运行。
+
+## 验证
+
+```powershell
+$env:TOSUB2_PYTHON = (Resolve-Path -LiteralPath '.venv/Scripts/python.exe').Path
 npm.cmd run check
+# 单独运行 2FA、退出设备和账号资料专项测试：
+npm.cmd run check:2fa
 ```
 
-此部署已验证本机运行；真实账号登录和第三方服务配置需要使用者自行提供账号及配置后使用。
-
-## 2026-09-23 本机修复记录
-
-- 修复直连 TLS 兜底配置只写入日志、未传入下一次登录进程的问题；保留每次手动操作最多一次直连兜底。
-- 修复 Windows 子进程管道使用 `selectors` 导致的 `WinError 10038`。Cloudflare 与 Sentinel 的本地运行时改用线程和队列处理输入输出，增加超时、错误输出和资源清理。
-- 修复等待 TLS 筛选或邮箱基线时，旧异步结果覆盖取消、重新登录等新状态的问题。
-- 失败提示保留具体原因，并区分直连和代理；新增进程与任务重试回归测试，接入 `npm run check`。
-
-本机测试中，直连 `https://chatgpt.com/` 出现 TLS 连接重置；通过正在运行的 Clash 本地 HTTP 代理 `http://127.0.0.1:7897` 请求首页返回 200。需要使用此代理时，在控制台的“代理 IP”中填写该地址；端口依赖本机 Clash 配置，关闭 Clash 后无法使用。该检查仅验证公开首页连接，不代表真实账号授权已完成。
-
-新增运行时测试含 11 项本地子进程用例。测试脚本共 10 项通过；原有 `console-restore-shutdown-smoke` 仍因 Windows `SIGTERM` 退出码为 null 而失败。完整检查会在该项中断，其后三项已分别执行并通过。
+测试使用虚构账号和本机模拟 HTTP 服务。Windows 集成测试使用隔离的临时 DPAPI 凭据目录，不修改真实账号。测试通过不代表已经在真实 ChatGPT 账号上执行重置或确认所有设备退出。

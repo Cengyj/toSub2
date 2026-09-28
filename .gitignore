@@ -13,3 +13,11 @@ chatgpt-protocol-session.json
 sub2api-import*.json
 login-checkpoint.json
 job-meta.json
+*.har
+# Local deployment records and captured account-request evidence are private.
+DEPLOYMENT.local.md
+docs/2fa-reset-request-evidence.json
+docs/2fa-logout-all-request-evidence.json
+docs/2fa-reset-request-audit.md
+docs/2fa-logout-all-request-audit.md
+docs/2fa-logout-all-design.md

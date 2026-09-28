@@ -226,6 +226,34 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .selection-text-button:disabled { color: #a8b0ad; cursor: default; }
 .bulk-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
 .bulk-button { height: 32px; }
+.totp-options { margin: 0 0 14px; padding: 12px 14px; border: 1px solid #d2e6de; border-radius: 6px; background: #f6fbf9; }
+.totp-logout-toggle { display: flex; align-items: center; gap: 8px; width: fit-content; color: var(--ink); font-size: 13px; font-weight: 650; cursor: pointer; }
+.totp-logout-toggle input { width: 16px; height: 16px; margin: 0; accent-color: var(--green); }
+.totp-options p { margin: 6px 0 0; color: #56635e; font-size: 12px; line-height: 1.6; }
+.totp-options .totp-selection-hint { color: var(--green-strong); }
+.totp-options-heading { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.totp-options-heading svg { flex-shrink: 0; }
+.batch-dialog.account-dialog { width: min(650px, 100%); }
+.account-dialog-description { margin: 18px 0 10px; overflow-wrap: anywhere; font-weight: 600; }
+.totp-reset-warning { padding: 12px; background: #fff8ed; border: 1px solid #eed8b4; border-radius: 6px; color: #77501d; font-size: 13px; line-height: 1.7; }
+.totp-confirm-option { margin: 20px 0 12px; padding: 16px; background: #edf8f3; border: 2px solid #98c9b3; border-radius: 7px; }
+.totp-confirm-option .totp-logout-toggle { font-size: 15px; width: 100%; align-items: flex-start; line-height: 1.5; }
+.totp-confirm-option .totp-logout-toggle input { width: 20px; height: 20px; margin-top: 1px; flex-shrink: 0; }
+.totp-confirm-option .totp-logout-toggle svg { margin-top: 2px; flex-shrink: 0; }
+.totp-confirm-option p { margin: 10px 0 0 28px; color: #4a6056; font-size: 12px; line-height: 1.7; }
+.account-source-loading { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+.account-source-fields { margin: 16px 0; display: grid; gap: 10px; }
+.account-source-field { padding: 12px; border: 1px solid #dce4e0; border-radius: 6px; background: #fafcfb; }
+.account-source-field-header, .account-source-field-header > div { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.account-source-field-header strong { font-size: 13px; }
+.account-source-field code { display: block; margin-top: 9px; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.account-source-field .masked-value { color: var(--muted); }
+.account-source-copy-notice { display: block; margin-top: 5px; font-size: 12px; color: var(--green-strong); }
+.account-source-actions { flex-wrap: wrap; }
+.totp-row-button { height: 32px; padding: 0 9px; white-space: nowrap; }
+.totp-eligibility, .logout-result { margin-top: 5px; color: #56635e; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.logout-result.succeeded { color: var(--green-strong); }
+.logout-result.failed, .logout-result.unknown { color: var(--danger); }
 .delete-button {
   height: 32px;
   padding: 0 10px;
@@ -305,6 +333,8 @@ tbody tr:last-child td { border-bottom: 0; }
   font-weight: 750;
 }
 .account-details { min-width: 0; }
+.account-quick-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+.account-quick-actions .secondary-button { height: 30px; padding: 0 8px; font-size: 11px; white-space: nowrap; }
 .account-cell strong { display: block; overflow: hidden; text-overflow: ellipsis; color: var(--ink); font-size: 13px; white-space: nowrap; }
 .account-cell span { display: block; margin-top: 4px; color: #8a9490; font-size: 11px; }
 .account-cell .mail-mode {
@@ -459,7 +489,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .operation-time-cell { color: #4f5b57; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .operation-time-cell time { display: block; font-size: 12px; }
 .operation-time-cell span { display: block; margin-top: 4px; color: #8a9490; font-size: 10px; white-space: normal; }
-.row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; white-space: nowrap; }
+.row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap; white-space: nowrap; }
 .row-actions > button { flex: 0 0 auto; white-space: nowrap; }
 .download-button { height: 32px; padding: 0 11px; font-size: 12px; }
 .retry-button {

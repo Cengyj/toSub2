@@ -11,9 +11,30 @@ import {
   TlsFingerprintTransport,
 } from "../src/tls-transport.mjs";
 
+const receivedRequests = [];
 const server = http.createServer(async (req, res) => {
   let body = "";
   for await (const chunk of req) body += chunk;
+  receivedRequests.push({ method: req.method, url: req.url, headers: req.headers, rawHeaders: req.rawHeaders, body });
+  if (req.url === "/single-attempt/challenge") {
+    res.writeHead(403, { "content-type": "text/html", "cf-mitigated": "challenge" });
+    res.end("<html><script>window._cf_chl_opt={};</script>Just a moment</html>");
+    return;
+  }
+  if (req.url === "/single-attempt/redirect") {
+    res.writeHead(307, { location: "/single-attempt/redirect-target" });
+    res.end();
+    return;
+  }
+  if (req.url === "/single-attempt/disconnect") {
+    req.socket.destroy();
+    return;
+  }
+  if (req.url === "/single-attempt/unavailable") {
+    res.writeHead(503, { "content-type": "application/json", "retry-after": "0" });
+    res.end('{"error":"synthetic service unavailable"}');
+    return;
+  }
   res.setHeader("content-type", "application/json");
   res.setHeader("set-cookie", ["transport_a=1; Max-Age=3600; Path=/", "transport_b=2; Path=/"]);
   if (req.url === "/sentinel") {
@@ -84,6 +105,9 @@ try {
     body: new URLSearchParams({ value: "ok" }),
   });
   assert.deepEqual(JSON.parse(await postResponse.text()), { method: "POST", body: "value=ok" });
+  await testSingleAttemptRequests(`http://127.0.0.1:${address.port}`);
+  await testSingleAttemptDispatchPolicy();
+  testSingleAttemptFallbackGuard();
 
   await testDynamicSentinelTransportMessage();
 
@@ -306,6 +330,176 @@ try {
 } finally {
   await transport.close();
   await new Promise((resolve) => server.close(resolve));
+}
+
+async function testSingleAttemptRequests(baseUrl) {
+  const omitHeaders = ["Content-Type", "SEC-FETCH-USER", "Upgrade-Insecure-Requests"];
+  const headers = {
+    "content-type": "application/json",
+    "sec-fetch-user": "?1",
+    "upgrade-insecure-requests": "1",
+    "sec-fetch-site": "same-origin",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-dest": "empty",
+    priority: "u=1, i",
+    accept: "*/*",
+    "user-agent": "synthetic-local-test",
+  };
+  for (const enabled of [true, false]) {
+    const current = new TlsFingerprintTransport({ enabled, sameProxyRiskRetryDelayMs: 0 });
+    let solverCalls = 0;
+    let requestDispatches = 0;
+    const originalSend = current.send.bind(current);
+    current.send = async (message) => {
+      if (message.operation === "solve_cloudflare") {
+        solverCalls += 1;
+        throw new Error("single-attempt tests must not launch challenge work");
+      }
+      if (message.operation === "request") {
+        assert.equal(new URL(message.url).hostname, "127.0.0.1");
+        requestDispatches += 1;
+      }
+      return originalSend(message);
+    };
+    try {
+      await current.configure(null);
+      // Exercise the retry policy without sending traffic through a real proxy.
+      current.hasConfiguredProxy = () => true;
+      const options = { singleAttempt: true, retryRiskControl: true, defaultHeaders: false, omitHeaders, headers };
+      for (const body of [undefined, null, ""]) {
+        const receivedBefore = receivedRequests.length;
+        const result = await current.request("POST", `${baseUrl}/single-attempt/empty`, { ...options, body });
+        await result.text();
+        assert.equal(receivedRequests.length - receivedBefore, 1, "one operation must reach the server once");
+        const request = receivedRequests.at(-1);
+        assert.equal(request.method, "POST");
+        assert.equal(request.body, "");
+        assert.equal(request.headers["content-length"], "0");
+        for (const name of omitHeaders) {
+          assert.equal(Object.hasOwn(request.headers, name.toLowerCase()), false, `${name} must be absent, not empty`);
+          assert.equal(request.rawHeaders.filter((_, i) => i % 2 === 0).some((item) => item.toLowerCase() === name.toLowerCase()), false);
+        }
+        assert.equal(request.headers["sec-fetch-site"], "same-origin");
+        assert.equal(request.headers["sec-fetch-mode"], "cors");
+        assert.equal(request.headers["sec-fetch-dest"], "empty");
+        assert.equal(request.headers.priority, "u=1, i");
+      }
+      const jsonBody = JSON.stringify({ factor_type: "totp", fixture: "synthetic-local-only" });
+      const jsonOptions = {
+        ...options, body: jsonBody, omitHeaders: omitHeaders.filter((name) => name.toLowerCase() !== "content-type"),
+      };
+      const receivedBeforeJson = receivedRequests.length;
+      const jsonResult = await current.request("POST", `${baseUrl}/single-attempt/json`, jsonOptions);
+      await jsonResult.text();
+      assert.equal(receivedRequests.length - receivedBeforeJson, 1);
+      assert.equal(receivedRequests.at(-1).body, jsonBody);
+      assert.equal(receivedRequests.at(-1).headers["content-type"], "application/json");
+      assert.equal(receivedRequests.at(-1).headers["content-length"], String(Buffer.byteLength(jsonBody)));
+      for (const mutationOptions of [options, jsonOptions]) {
+        for (const [endpoint, expectedStatus] of [["challenge", 403], ["redirect", 307], ["unavailable", 503]]) {
+          const receivedBefore = receivedRequests.length;
+          const dispatchesBefore = requestDispatches;
+          const result = await current.request("POST", `${baseUrl}/single-attempt/${endpoint}`, { ...mutationOptions, redirect: "follow" });
+          await result.text();
+          assert.equal(result.status, expectedStatus);
+          assert.equal(receivedRequests.length - receivedBefore, 1, `${endpoint} must not replay or follow`);
+          if (enabled) assert.equal(requestDispatches - dispatchesBefore, 1);
+          assert.equal(solverCalls, 0, "singleAttempt must prevent solver and auxiliary requests");
+        }
+        const receivedBefore = receivedRequests.length;
+        const dispatchesBefore = requestDispatches;
+        await assert.rejects(current.request("POST", `${baseUrl}/single-attempt/disconnect`, mutationOptions), (error) => {
+          assert.doesNotMatch(error.message, /PROXY_CONNECTION_RETRY|PROXY_RISK_CONTROL/);
+          return true;
+        });
+        assert.equal(receivedRequests.length - receivedBefore, 1, `an uncertain connection failure must not resubmit (TLS=${enabled})`);
+        if (enabled) assert.equal(requestDispatches - dispatchesBefore, 1);
+        assert.equal(solverCalls, 0);
+      }
+      if (enabled) {
+        const result = await current.request("POST", `${baseUrl}/single-attempt/defaults`);
+        await result.text();
+        assert.equal(receivedRequests.at(-1).headers["content-type"], "application/x-www-form-urlencoded");
+        assert.equal(receivedRequests.at(-1).headers["sec-fetch-mode"], "navigate", "per-request policies must not change later defaults");
+      }
+    } finally {
+      await current.close();
+    }
+  }
+  const fallback = new TlsFingerprintTransport({ enabled: true, profile: "chrome999" });
+  try {
+    const receivedBefore = receivedRequests.length;
+    const result = await fallback.request("POST", `${baseUrl}/single-attempt/fallback`, {
+      singleAttempt: true, defaultHeaders: false, omitHeaders, headers,
+    });
+    await result.text();
+    assert.equal(result.status, 200);
+    assert.equal(receivedRequests.length - receivedBefore, 1, "unsupported profile fallback must fail before the first network send");
+    assert.equal(receivedRequests.at(-1).headers["content-type"], undefined, "fallback must preserve header omissions");
+    assert.equal(receivedRequests.at(-1).headers["content-length"], "0");
+  } finally {
+    await fallback.close();
+  }
+}
+
+async function testSingleAttemptDispatchPolicy() {
+  const current = new TlsFingerprintTransport({ enabled: true });
+  let requests = 0;
+  const failure = new Error("Timeout: curl: (28) local synthetic timeout");
+  current.send = async (message) => {
+    if (message.operation === "configure") return {};
+    assert.equal(message.operation, "request", "singleAttempt must not submit solver operations");
+    requests += 1;
+    assert.equal(message.singleAttempt, true);
+    throw failure;
+  };
+  await current.configure("http://127.0.0.1:9");
+  try {
+    await assert.rejects(current.request("POST", "http://127.0.0.1/synthetic", {
+      singleAttempt: true, retryRiskControl: true,
+    }), (error) => error === failure);
+    assert.equal(requests, 1);
+  } finally {
+    await current.close();
+  }
+}
+
+function testSingleAttemptFallbackGuard() {
+  const python = findTestPython();
+  assert.ok(python);
+  const workerPath = fileURLToPath(new URL("../src/tls_transport.py", import.meta.url));
+  const script = String.raw`
+import importlib.util
+import sys
+spec = importlib.util.spec_from_file_location("tosub2_tls_transport", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+class FakeSession:
+    calls = 0
+    curl_options = {module.CurlOpt.CONNECTTIMEOUT_MS: 321}
+    def request(self, *args, **kwargs):
+        self.calls += 1
+        assert self.curl_options[module.CurlOpt.FRESH_CONNECT] == 1
+        assert self.curl_options[module.CurlOpt.FORBID_REUSE] == 1
+        assert self.curl_options[module.CurlOpt.CONNECTTIMEOUT_MS] == 321
+        raise RuntimeError("Impersonating synthetic is not supported after unknown dispatch")
+session = FakeSession()
+original_options = session.curl_options
+worker = module.Worker()
+worker.session = session
+try:
+    worker._request_with_profile_fallback("POST", "http://127.0.0.1/", {}, None, 1000, single_attempt=True)
+except RuntimeError as error:
+    assert "unknown dispatch" in str(error)
+else:
+    raise AssertionError("generic lookalike errors must not cause a one-shot fallback")
+assert session.calls == 1, session.calls
+assert session.curl_options is original_options, "one-shot curl options must be restored"
+`;
+  const result = spawnSync(python.command, [...python.args, "-c", script, workerPath], {
+    encoding: "utf8", env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" }, windowsHide: true,
+  });
+  assert.equal(result.status, 0, `one-shot fallback guard failed:\n${result.stderr || result.stdout}`);
 }
 
 async function testChallengeFailureDiagnostics() {

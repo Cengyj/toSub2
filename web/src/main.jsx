@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Ban,
@@ -11,6 +11,8 @@ import {
   Copy,
   Download,
   ExternalLink,
+  Eye,
+  EyeOff,
   FileText,
   Filter,
   Globe2,
@@ -18,6 +20,7 @@ import {
   ListPlus,
   LoaderCircle,
   LogIn,
+  LogOut,
   Mail,
   MailCheck,
   Plus,
@@ -73,6 +76,9 @@ function App() {
   const [selectedJobIds, setSelectedJobIds] = useState(() => new Set());
   const [jobSelectionIndex, setJobSelectionIndex] = useState([]);
   const [batchAction, setBatchAction] = useState("");
+  const [totpAction, setTotpAction] = useState(null);
+  const [sourceJobId, setSourceJobId] = useState(null);
+  const sourceExportInFlight = useRef(false);
   const [page, setPage] = useState(1);
   const [pagination, setPagination] = useState({ page: 1, pageSize: 20, total: 0, totalPages: 1 });
   const [stats, setStats] = useState({ active: 0, queued: 0, completed: 0 });
@@ -218,6 +224,20 @@ function App() {
   const totpSetupSelectedCount = selectedJobs.filter((job) => job.canSetupTotp).length;
   const canSetupTotpSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && totpSetupSelectedCount > 0;
+  const totpResetSelectedCount = selectedJobs.filter((job) => job.canResetTotp).length;
+  const canResetTotpSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
+    && totpResetSelectedCount > 0;
+  const totpSelectionHint = !selectedJobIds.size
+    ? "请先勾选账号，再点击批量设置 2FA。"
+    : selectedJobs.length !== selectedJobIds.size
+      ? "正在读取所选账号的 2FA 状态。"
+      : totpSetupSelectedCount > 0
+        ? `所选 ${selectedJobIds.size} 个账号中，${totpSetupSelectedCount} 个可以设置 2FA，其余会跳过。`
+        : canResetTotpSelected
+          ? `所选账号已有 2FA，${totpResetSelectedCount} 个可以使用“批量重置 2FA”更换密钥。`
+        : selectedJobs.every((job) => job.hasTotpKey || job.totpKnownEnabled)
+          ? "所选账号已设置 2FA，不能重复设置或在此更换密钥。"
+          : selectedJobs[0]?.totpSetupUnavailableReason || "所选账号暂不能设置 2FA：需要完成授权，或保留有效的邮箱登录检查点。";
   const passwordAddSelectedCount = selectedJobs.filter((job) => job.canAddPassword).length;
   const canAddPasswordSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && passwordAddSelectedCount > 0;
@@ -579,22 +599,24 @@ function App() {
     }
   }
 
-  async function setupTotpSelected() {
-    if (!canSetupTotpSelected || batchAction) return;
-    const skipped = selectedJobIds.size - totpSetupSelectedCount;
-    const message = `确定为选中的 ${totpSetupSelectedCount} 个账号设置 2FA 吗？${skipped ? `另有 ${skipped} 个账号不符合条件，将自动跳过。` : ""}`;
-    if (!window.confirm(message)) return;
-    setBatchAction("setup-2fa");
+  function setupTotpSelected(resetTotp = false) {
+    if (!(resetTotp ? canResetTotpSelected : canSetupTotpSelected) || batchAction) return;
+    const eligibleCount = resetTotp ? totpResetSelectedCount : totpSetupSelectedCount;
+    setTotpAction({ ids: [...selectedJobIds], resetTotp, batch: true, eligibleCount, skipped: selectedJobIds.size - eligibleCount });
+  }
+
+  async function submitTotpAction(logoutAfterSetup) {
+    const { ids, resetTotp, batch } = totpAction;
+    setBatchAction(resetTotp ? "reset-2fa" : "setup-2fa");
     try {
-      const data = await apiFetch(token, "/api/jobs/setup-2fa-batch", {
+      const data = await apiFetch(token, batch ? "/api/jobs/setup-2fa-batch" : `/api/jobs/${ids[0]}/setup-2fa`, {
         method: "POST",
-        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ ...(batch ? { ids } : {}), proxyUrl: accountProxyUrl.trim(), resetTotp, logoutAllDevicesAfterTotp: Boolean(features.logoutAllDevicesAfterTotp && logoutAfterSetup) }),
       });
-      setUploadNotice(`已开始为 ${data.started} 个账号设置 2FA${data.skipped ? `，跳过 ${data.skipped} 个` : ""}`);
-      setSelectedJobIds(new Set());
+      setUploadNotice(`已开始为 ${batch ? data.started : 1} 个账号${resetTotp ? "重置" : "设置"} 2FA${data.skipped ? `，跳过 ${data.skipped} 个` : ""}；完成后可在账号旁查看资料或导出账号资料。`);
+      setTotpAction(null);
+      if (batch) setSelectedJobIds(new Set());
       setError("");
-    } catch (requestError) {
-      setError(requestError.message);
     } finally {
       setBatchAction("");
     }
@@ -642,21 +664,27 @@ function App() {
     }
   }
 
-  async function exportSelectedSource() {
-    if (!selectedJobIds.size || batchAction) return;
+  async function exportAccountSource(ids) {
+    if (!ids.length || batchAction || sourceExportInFlight.current) return "请等待当前操作完成后再导出。";
+    sourceExportInFlight.current = true;
     setBatchAction("source");
     try {
       const response = await fetch("/api/jobs/export-source", {
         method: "POST",
         headers: { "content-type": "application/json", "x-console-token": token },
-        body: JSON.stringify({ ids: [...selectedJobIds] }),
+        body: JSON.stringify({ ids }),
+        cache: "no-store",
       });
-      if (!response.ok) throw new Error((await response.json()).error || "原始信息导出失败");
-      await saveDownloadResponse(response, `chatgpt-account-source-${selectedJobIds.size}-accounts-${localTimestamp()}.txt`);
+      if (!response.ok) throw new Error((await response.json()).error || "账号资料导出失败");
+      await saveDownloadResponse(response, `chatgpt-account-source-${ids.length}-accounts-${localTimestamp()}.txt`);
       setError("");
+      setUploadNotice("账号资料已导出，包含当前保存的密码、2FA 密钥及收码信息，请妥善保管。");
+      return "";
     } catch (requestError) {
       setError(requestError.message);
+      return requestError.message;
     } finally {
+      sourceExportInFlight.current = false;
       setBatchAction("");
     }
   }
@@ -900,9 +928,9 @@ function App() {
                 </button>
               )}
               {features.sourceExport && (
-                <button type="button" className="secondary-button bulk-button" onClick={exportSelectedSource} disabled={!selectedJobIds.size || Boolean(batchAction)}>
+                <button type="button" className="secondary-button bulk-button" onClick={() => exportAccountSource([...selectedJobIds])} disabled={!selectedJobIds.size || Boolean(batchAction)}>
                   {batchAction === "source" ? <LoaderCircle className="spin" size={16} /> : <FileText size={16} />}
-                  导出原始信息
+                  批量导出账号资料
                 </button>
               )}
               <button type="button" className="regenerate-button bulk-button" onClick={reauthorizeSelected} disabled={!canReauthorizeSelected || Boolean(batchAction)}>
@@ -916,9 +944,15 @@ function App() {
                 </button>
               )}
               {features.totpSetup && (
-                <button type="button" className="secondary-button bulk-button" onClick={setupTotpSelected} disabled={!canSetupTotpSelected || Boolean(batchAction)}>
+                <button type="button" className="secondary-button bulk-button" onClick={() => setupTotpSelected(false)} disabled={!canSetupTotpSelected || Boolean(batchAction)} title={totpSelectionHint} aria-describedby="totp-selection-hint">
                   {batchAction === "setup-2fa" ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
                   批量设置 2FA
+                </button>
+              )}
+              {features.totpReset && (
+                <button type="button" className="secondary-button bulk-button" onClick={() => setupTotpSelected(true)} disabled={!canResetTotpSelected || Boolean(batchAction)} title="移除已有 2FA 并启用新密钥；旧密钥将失效" aria-describedby="totp-selection-hint">
+                  {batchAction === "reset-2fa" ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}
+                  批量重置 2FA
                 </button>
               )}
               {features.passwordAdd && (
@@ -933,6 +967,16 @@ function App() {
               </button>
             </div>
           </div>
+        )}
+
+        {features.totpSetup && (
+          <section className="totp-options" aria-label="2FA 设置选项">
+            {features.logoutAllDevicesAfterTotp && (
+              <strong className="totp-options-heading"><LogOut size={17} />退出所有设备：点击“设置 2FA”或“重置 2FA”，在确认窗口中勾选。</strong>
+            )}
+            <p>单个和批量操作均可选择。账号名下方提供“查看资料”和“导出账号资料”，完成后可获取新密钥。</p>
+            <p id="totp-selection-hint" className="totp-selection-hint">{totpSelectionHint}</p>
+          </section>
         )}
 
         <div className="table-frame">
@@ -974,6 +1018,12 @@ function App() {
                     onUpload={() => uploadSelected([job.id])}
                     sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey)}
                     totpSetupAvailable={Boolean(features.totpSetup)}
+                    totpResetAvailable={Boolean(features.totpReset)}
+                    onSetupTotp={(resetTotp) => setTotpAction({ ids: [job.id], resetTotp, batch: false, email: job.email, eligibleCount: 1, skipped: 0 })}
+                    accountActionsBusy={Boolean(batchAction)}
+                    sourceExportAvailable={Boolean(features.sourceExport)}
+                    onViewSource={() => setSourceJobId(job.id)}
+                    onExportSource={() => exportAccountSource([job.id])}
                     passwordAddAvailable={Boolean(features.passwordAdd)}
                     forceReloginAvailable={Boolean(features.forceRelogin)}
                     accountProxyUrl={accountProxyUrl}
@@ -1000,6 +1050,8 @@ function App() {
           </nav>
         )}
       </section>
+      {totpAction && <TotpActionDialog action={totpAction} logoutAvailable={Boolean(features.logoutAllDevicesAfterTotp)} onSubmit={submitTotpAction} onClose={() => setTotpAction(null)} />}
+      {sourceJobId && <AccountSourceDialog key={sourceJobId} token={token} job={jobs.find((job) => job.id === sourceJobId)} onClose={() => setSourceJobId(null)} onExport={() => exportAccountSource([sourceJobId])} exportBusy={Boolean(batchAction)} />}
       {smsSettingsOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget) setSmsSettingsOpen(false);
@@ -1480,7 +1532,134 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
+function AccountDialogShell({ title, titleId, onClose, busy = false, children, className = "" }) {
+  const dialogRef = useRef(null);
+  useEffect(() => {
+    const previous = document.activeElement;
+    dialogRef.current?.focus();
+    return () => { if (previous?.isConnected) previous.focus(); };
+  }, []);
+  function handleKeyDown(event) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      if (!busy) onClose();
+    }
+    if (event.key !== "Tab") return;
+    const buttons = [...dialogRef.current.querySelectorAll('button:not(:disabled), input:not(:disabled), [tabindex="0"]')];
+    const first = buttons[0];
+    const last = buttons[buttons.length - 1];
+    if (!first) { event.preventDefault(); return; }
+    if (event.shiftKey && (document.activeElement === first || document.activeElement === dialogRef.current)) {
+      event.preventDefault(); last.focus();
+    } else if (!event.shiftKey && (document.activeElement === last || document.activeElement === dialogRef.current)) {
+      event.preventDefault(); first.focus();
+    }
+  }
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+    if (event.target === event.currentTarget && !busy) onClose();
+  }}>
+    <section ref={dialogRef} tabIndex={-1} className={`batch-dialog account-dialog ${className}`} role="dialog" aria-modal="true" aria-labelledby={titleId} onKeyDown={handleKeyDown}>
+      <div className="dialog-header"><h2 id={titleId}>{title}</h2><button type="button" className="icon-button" onClick={onClose} disabled={busy} aria-label="关闭窗口"><X size={18} /></button></div>
+      {children}
+    </section>
+  </div>;
+}
+
+function TotpActionDialog({ action, logoutAvailable, onSubmit, onClose }) {
+  const [logout, setLogout] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const submitting = useRef(false);
+  const verb = action.resetTotp ? "重置" : "设置";
+  async function submit(event) {
+    event.preventDefault();
+    if (submitting.current) return;
+    submitting.current = true;
+    setBusy(true); setError("");
+    try { await onSubmit(logout); }
+    catch (requestError) { setError(requestError.message); }
+    finally { submitting.current = false; setBusy(false); }
+  }
+  return <AccountDialogShell title={`${verb} 2FA`} titleId="totp-action-title" busy={busy} onClose={onClose} className="totp-action-dialog">
+    <form onSubmit={submit}>
+      <p className="account-dialog-description">{action.batch ? `为选中的 ${action.eligibleCount} 个账号${verb} 2FA` : action.email}</p>
+      {action.resetTotp && <p className="totp-reset-warning">重置会先移除旧 2FA，再生成并启用新密钥。旧验证器中的验证码将失效；中途失败可能暂时没有有效 2FA。</p>}
+      {action.skipped > 0 && <p className="dialog-hint">另有 {action.skipped} 个账号不符合条件，将自动跳过。</p>}
+      {logoutAvailable && <div className="totp-confirm-option">
+        <label className="totp-logout-toggle"><input type="checkbox" checked={logout} disabled={busy} onChange={(event) => setLogout(event.target.checked)} aria-describedby="totp-confirm-help" /><LogOut size={19} /><span>成功后退出所有设备（仅本次）</span></label>
+        <p id="totp-confirm-help">默认不勾选。新 2FA 启用并安全保存后，每个账号仅提交一次退出请求，包括当前网页登录；不巡检、不自动重试。</p>
+      </div>}
+      <p className="dialog-hint">完成后可点击“查看资料”或“导出账号资料”，保存新的 2FA 密钥。关闭此窗口后，本次退出选项不会保留。</p>
+      {error && <p className="dialog-error" role="alert"><CircleAlert size={16} />{error}</p>}
+      <div className="dialog-actions"><button type="button" className="secondary-button" onClick={onClose} disabled={busy}>取消</button><button type="submit" className="primary-button" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}{busy ? "正在提交…" : `确认${verb} 2FA`}</button></div>
+    </form>
+  </AccountDialogShell>;
+}
+
+function AccountSourceDialog({ token, job, onClose, onExport, exportBusy }) {
+  const [revision, setRevision] = useState(0);
+  const [result, setResult] = useState(null);
+  const [exportError, setExportError] = useState("");
+  const signature = JSON.stringify([job?.id, job?.status, job?.lastOperationAt, job?.updatedAt, job?.accountSourceVersion, job?.hasTotpKey, job?.totpCredentialInvalidated, job?.totpRecoveryPending, revision]);
+  const jobId = job?.id;
+  useEffect(() => {
+    let stopped = false;
+    const controller = new AbortController();
+    setResult(null); setExportError("");
+    if (!jobId) { setResult({ signature, error: "账号已不在当前列表中，请关闭窗口后重新打开。" }); return () => controller.abort(); }
+    apiFetch(token, `/api/jobs/${jobId}/source`, { cache: "no-store", signal: controller.signal })
+      .then((data) => { if (!stopped) setResult({ signature, account: data.account, loadedAt: new Date().toLocaleTimeString() }); })
+      .catch((error) => { if (!stopped) setResult({ signature, error: error.message }); });
+    return () => { stopped = true; controller.abort(); };
+  }, [jobId, signature, token]);
+  const current = result?.signature === signature ? result : null;
+  const account = current?.account;
+  async function exportNow() {
+    setExportError("");
+    const message = await onExport();
+    if (message) setExportError(message);
+  }
+  return <AccountDialogShell title="账号资料" titleId="account-source-title" onClose={onClose} className="account-source-dialog">
+    <p className="account-dialog-description">{job?.email || "账号不可用"}</p>
+    <p className="dialog-hint">显示本机当前保存的登录资料。敏感字段默认隐藏；点击导出会重新读取服务端最新资料，2FA 设置或重置成功后可导出新密钥。</p>
+    {!current && <p className="account-source-loading" role="status"><LoaderCircle className="spin" size={16} />正在读取当前资料…</p>}
+    {current?.error && <p className="dialog-error" role="alert"><CircleAlert size={16} />{current.error}</p>}
+    {account && <div className="account-source-fields" key={signature}>
+      <SecretSourceField label="邮箱" value={account.email} sensitive={false} />
+      <SecretSourceField label="密码" value={account.password} />
+      <SecretSourceField label="2FA 密钥" value={account.totpSecret} />
+      <SecretSourceField label="邮箱收码地址" value={account.mailApiUrl} />
+      <SecretSourceField label="邮箱请求数据" value={account.mailRequestBody} />
+      <p className="dialog-hint">读取时间：{current.loadedAt}。账号操作状态变化时会重新读取，尚未安全保存或待恢复的 2FA 不会显示为有效密钥。</p>
+    </div>}
+    {exportError && <p className="dialog-error" role="alert">{exportError}</p>}
+    <div className="dialog-actions account-source-actions">
+      <button type="button" className="secondary-button" onClick={() => setRevision((value) => value + 1)} disabled={!current}><RefreshCw size={16} />刷新资料</button>
+      <button type="button" className="secondary-button" onClick={onClose}>关闭</button>
+      <button type="button" className="primary-button" onClick={exportNow} disabled={!account || exportBusy}>{exportBusy ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}导出账号资料</button>
+    </div>
+  </AccountDialogShell>;
+}
+
+function SecretSourceField({ label, value, sensitive = true }) {
+  const [revealed, setRevealed] = useState(false);
+  const [notice, setNotice] = useState("");
+  const present = typeof value === "string" && value.length > 0;
+  async function copy() {
+    try { await navigator.clipboard.writeText(value); setNotice("已复制"); }
+    catch { setNotice("复制失败，请显示后手动复制"); }
+  }
+  return <div className="account-source-field">
+    <div className="account-source-field-header"><strong>{label}</strong><div>
+      {sensitive && present && <button type="button" className="text-action" onClick={() => setRevealed((current) => !current)} aria-label={`${revealed ? "隐藏" : "显示"}${label}`}>{revealed ? <EyeOff size={15} /> : <Eye size={15} />}{revealed ? "隐藏" : "显示"}</button>}
+      <button type="button" className="text-action" disabled={!present} onClick={copy} aria-label={`复制${label}`}><Copy size={15} />复制</button>
+    </div></div>
+    <code className={sensitive && !revealed ? "masked-value" : ""}>{!present ? "未保存" : sensitive && !revealed ? "••••••••" : value}</code>
+    {notice && <span className="account-source-copy-notice" role="status">{notice}</span>}
+  </div>;
+}
+
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, totpResetAvailable, onSetupTotp, accountActionsBusy, sourceExportAvailable, onViewSource, onExportSource, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -1547,21 +1726,6 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     setSubmitting(true);
     try {
       await apiFetch(token, `/api/jobs/${job.id}/relogin`, {
-        method: "POST",
-        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
-      });
-      onError("");
-    } catch (requestError) {
-      onError(requestError.message);
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  async function setupTotp() {
-    setSubmitting(true);
-    try {
-      await apiFetch(token, `/api/jobs/${job.id}/setup-2fa`, {
         method: "POST",
         body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
       });
@@ -1646,6 +1810,24 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           <div className="account-details"><strong>{job.email}</strong><span>{shortId(job.id)}</span></div>
           <LoginMethodBadge job={job} />
         </div>
+        <div className="account-quick-actions">
+          {sourceExportAvailable && <>
+            <button type="button" className="secondary-button" onClick={onViewSource} title="查看当前保存的邮箱、密码、2FA 密钥与收码信息"><Eye size={16} />查看资料</button>
+            <button type="button" className="secondary-button" onClick={onExportSource} disabled={accountActionsBusy} title="下载当前保存的账号资料；2FA 设置或重置完成后包含新密钥"><FileText size={16} />导出账号资料</button>
+          </>}
+          {totpSetupAvailable && (
+            <button type="button" className="secondary-button totp-row-button" onClick={() => onSetupTotp(false)} disabled={!job.canSetupTotp || submitting || accountActionsBusy} title={job.canSetupTotp ? "设置 2FA；确认窗口可勾选成功后退出所有设备" : job.totpSetupUnavailableReason || "当前账号暂不能设置 2FA"}>
+              {submitting ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
+              {job.hasTotpKey || job.totpKnownEnabled ? "已设置 2FA" : "设置 2FA"}
+            </button>
+          )}
+          {totpResetAvailable && (job.canResetTotp || job.hasTotpKey || job.totpKnownEnabled) && (
+            <button type="button" className="secondary-button totp-row-button" onClick={() => onSetupTotp(true)} disabled={!job.canResetTotp || submitting || accountActionsBusy} title={job.canResetTotp ? "移除旧 2FA 并启用新密钥；确认窗口可勾选成功后退出所有设备" : job.totpResetUnavailableReason || "当前状态暂不能重置 2FA"}>
+              {submitting ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}
+              重置 2FA
+            </button>
+          )}
+        </div>
       </td>
       <td><StatusBadge status={job.status} /></td>
       <td className="step-cell">
@@ -1655,6 +1837,13 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           <div className="row-error">号池监控已永久跳过：{extractResponseMessage(job.autoRepairBlockedReason || "账号已不可用")}</div>
         )}
         {job.totpSetupError && <div className="row-error">2FA：{extractResponseMessage(job.totpSetupError)}</div>}
+        {totpSetupAvailable && !job.canSetupTotp && job.totpSetupUnavailableReason && <div className="totp-eligibility">2FA：{job.canResetTotp ? "已启用；可点击“重置 2FA”更换密钥" : job.totpSetupUnavailableReason}</div>}
+        {job.logoutAllDevicesStatus && job.logoutAllDevicesStatus !== "not_requested" && (
+          <div className={`logout-result ${job.logoutAllDevicesStatus}`} role="status">
+            退出所有设备：{({ pending: "等待 2FA 激活并安全保存密钥", succeeded: "请求已成功提交", failed: "请求失败，未自动重试", unknown: "结果未确认，请手动核实，未自动重试", skipped: "本次未执行" })[job.logoutAllDevicesStatus] || "状态待确认"}
+            {job.logoutAllDevicesError && <span>；{extractResponseMessage(job.logoutAllDevicesError)}</span>}
+          </div>
+        )}
         {job.passwordAddError && <div className="row-error">添加密码：{extractResponseMessage(job.passwordAddError)}</div>}
         {job.mailApiError && job.status === "email_otp" && <div className="mail-error">{job.mailApiError}</div>}
         {job.currentPhone && ["working", "phone", "phone_otp"].includes(job.status) && (
@@ -1744,7 +1933,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         <div className="row-actions">
           {job.canDownload && (
             <button type="button" className="download-button" onClick={download}>
-              <Download size={16} />下载
+              <Download size={16} />下载授权文件
             </button>
           )}
           {job.canDownload && sub2apiUploadAvailable && (
@@ -1762,11 +1951,6 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
             <button type="button" className="relogin-button" onClick={forceRelogin} disabled={submitting} title="跳过刷新令牌和旧检查点，完整重新登录后自动授权">
               {submitting ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
               重新登录并授权
-            </button>
-          )}
-          {totpSetupAvailable && job.canSetupTotp && (
-            <button type="button" className="icon-button" onClick={setupTotp} disabled={submitting} title="设置 2FA">
-              {submitting ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
             </button>
           )}
           {passwordAddAvailable && job.canAddPassword && (

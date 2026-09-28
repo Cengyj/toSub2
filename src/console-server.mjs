@@ -209,11 +209,14 @@ async function handleApi(req, res, requestUrl) {
         smsProviders: publicSmsProviderDefinitions(),
         queue: true,
         sourceExport: true,
+        sourceView: true,
         cancelAll: true,
         sub2apiUpload: true,
         sub2apiMonitor: true,
         tlsFingerprint: true,
         totpSetup: true,
+        totpReset: true,
+        logoutAllDevicesAfterTotp: true,
         passwordAdd: true,
         forceRelogin: true,
       },
@@ -352,9 +355,11 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/setup-2fa-batch") {
     const body = await readJson(req);
+    normalizeLogoutAllDevicesOption(body);
+    const resetTotp = normalizeResetTotpOption(body);
     const selected = resolveSelectedJobs(body.ids);
     const started = await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
-      if (!canSetupTotp(job)) return null;
+      if (!(resetTotp ? canResetTotp(job) : canSetupTotp(job))) return null;
       await startTotpSetup(job, body);
       return job;
     })));
@@ -531,7 +536,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|logs|download|sms-number|luban-number))?$/.exec(requestUrl.pathname);
+  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|logs|download|source|sms-number|luban-number))?$/.exec(requestUrl.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -544,6 +549,12 @@ async function handleApi(req, res, requestUrl) {
   }
 
   const action = match[2];
+  if (req.method === "GET" && action === "source") {
+    const snapshot = await readAccountSource(job);
+    assertAccountSourceSnapshotCurrent(snapshot);
+    sendJson(res, 200, { account: snapshot.account });
+    return;
+  }
   if (req.method === "GET" && action === "logs") {
     sendJson(res, 200, { id: job.id, logs: job.logs });
     return;
@@ -706,6 +717,8 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     totpSetupUri: null,
     totpSetupError: null,
     totpSetupResumesAuthorization: false,
+    ...newLogoutAllDevicesState(),
+    ...newTotpResetState(),
     passwordAddError: null,
     passwordAddedAt: null,
     pendingNewPassword: null,
@@ -815,7 +828,11 @@ function launchJob(job, options = {}) {
   const runId = crypto.randomUUID();
   job.runId = runId;
   job.runMode = mode;
+  if (mode === "totp_setup") job.totpOperationId = runId;
   job.mailOtpRequestedAt = null;
+  const logoutAfterTotp = mode === "totp_setup" && job.logoutAllDevicesAfterTotp === true;
+  const resetTotp = mode === "totp_setup" && job.resetTotp === true;
+  const totpUsesIpc = logoutAfterTotp || resetTotp;
   const args = mode === "refresh"
     ? [
         PROTOCOL_SCRIPT,
@@ -833,6 +850,8 @@ function launchJob(job, options = {}) {
           "--setup-totp",
           "--totp-result",
           job.totpResultPath,
+          ...(logoutAfterTotp ? ["--logout-all-devices-after-totp"] : []),
+          ...(resetTotp ? ["--reset-totp"] : []),
           ...(job.totpSetupResumesAuthorization ? ["--resume-checkpoint", job.checkpointPath] : []),
           "--verbose",
         ]
@@ -866,18 +885,31 @@ function launchJob(job, options = {}) {
     env: {
       ...process.env,
       CHATGPT_LOGIN_PASSWORD: job.password || "",
-      CHATGPT_TOTP_SECRET: job.totpSecret || "",
+      CHATGPT_TOTP_SECRET: job.totpCredentialInvalidated ? "" : job.totpSecret || "",
       CHATGPT_NEW_PASSWORD: mode === "password_add" ? job.pendingNewPassword || "" : "",
+      TOSUB2_TOTP_OPERATION_ID: totpUsesIpc ? runId : "",
       CHATGPT_PROXY_URL: job.proxyUrl || "",
       CHATGPT_PROXY_MAX_ATTEMPTS: String(Math.max(0, MAX_PROXY_RISK_RETRIES - (job.proxyRiskRetryCount || 0))),
       TOSUB2_TLS_PROFILE:
         String(process.env.TOSUB2_TLS_PROFILE || "").trim()
         || (!job.proxyUrl ? String(job.directTlsProfile || options.tlsProfile || DEFAULT_TLS_PROFILE) : ""),
     },
-    stdio: ["pipe", "pipe", "pipe"],
+    stdio: totpUsesIpc ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
   job.child = child;
+  if (totpUsesIpc) {
+    child.on("message", (message) => {
+      if (message?.type === "totp-reset-state" && message.operationId === runId && resetTotp) {
+        void withEmailJobLock(job.email, () => acknowledgeTotpResetState(job, child, runId))
+          .catch(() => sendTotpCredentialAck(child, runId, false, "totp-reset-state-persisted"));
+        return;
+      }
+      if (message?.type !== "totp-credential-ready" || message.operationId !== runId) return;
+      void withEmailJobLock(job.email, () => acknowledgeTotpCredential(job, child, runId))
+        .catch(() => sendTotpCredentialAck(child, runId, false));
+    });
+  }
 
   child.stdout.on("data", (chunk) => {
     if (job.runId === runId) consumeOutput(job, chunk.toString("utf8"));
@@ -947,11 +979,13 @@ function handleChildCloseFailure(job, mode, runId, error) {
   if (job.runId !== runId && !(["totp_setup", "password_add"].includes(mode) && job.runId === null)) return;
   const message = `收尾处理失败：${error.message}`;
   if (mode === "totp_setup") {
-    job.status = "completed";
-    job.prompt = "原授权文件仍然可用，2FA 密钥尚未完成安全保存";
+    job.status = job.resultSaved ? "completed" : "failed";
+    job.prompt = "2FA 收尾未完成，私有恢复结果已保留";
     job.totpSetupError = `${message}；已保留 2FA 结果文件，请重试保存`;
+    job.totpRecoveryPending = true;
     job.runMode = null;
     job.runId = null;
+    applyTotpResetCompletion(job);
   } else if (mode === "password_add") {
     restorePasswordAddFailure(job, message);
   } else {
@@ -963,6 +997,7 @@ function handleChildCloseFailure(job, mode, runId, error) {
 }
 
 async function retryJob(job, options = {}) {
+  if (job.totpCredentialInvalidated || job.totpRecoveryPending) throw httpError(409, "2FA 恢复未完成，请先核实并导入有效密钥");
   if (!["failed", "canceled", "reauth_required", "resume_available"].includes(job.status)) {
     throw httpError(409, "当前任务不需要重新授权");
   }
@@ -1008,6 +1043,7 @@ async function retryJob(job, options = {}) {
 }
 
 async function regenerateJob(job, options = {}) {
+  if (job.totpCredentialInvalidated || job.totpRecoveryPending) throw httpError(409, "2FA 恢复未完成，请先核实有效密钥");
   if (job.status !== "completed" || !job.resultSaved) {
     throw httpError(409, "只能为已经完成的任务重新生成授权");
   }
@@ -1030,6 +1066,10 @@ async function regenerateJob(job, options = {}) {
 }
 
 async function forceReloginJob(job, options = {}, context = {}) {
+  await assertNoPendingTotpRecovery(job);
+  if (job.totpCredentialInvalidated) {
+    throw httpError(409, "2FA 重置状态未确认，请先手动核实并导入有效的新密钥；已保留私有恢复结果");
+  }
   if (!canForceRelogin(job)) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
@@ -1094,7 +1134,7 @@ async function reloadMissingJobCredentials(job) {
   ) return;
   const stored = await loadStoredLoginCredentials(job.email);
   job.password ||= stored.password;
-  job.totpSecret ||= stored.totpSecret;
+  if (!job.totpCredentialInvalidated) job.totpSecret ||= stored.totpSecret;
   job.proxyUrl ||= stored.proxyUrl;
   if (job.password) job.hasPasswordCredential = true;
   if (job.totpSecret) job.hasTotpCredential = true;
@@ -1104,13 +1144,16 @@ async function reloadMissingJobCredentials(job) {
 }
 
 async function startTotpSetup(job, options = {}) {
-  if (!canSetupTotp(job)) {
-    throw httpError(409, "只能为已完成授权，或已保存邮箱登录检查点且尚未设置 2FA 的账号设置 2FA");
+  const logoutAllDevicesAfterTotp = normalizeLogoutAllDevicesOption(options);
+  const resetTotp = normalizeResetTotpOption(options);
+  await assertNoPendingTotpRecovery(job);
+  if (!(resetTotp ? canResetTotp(job) : canSetupTotp(job))) {
+    throw httpError(409, resetTotp ? totpResetUnavailableReason(job) : totpSetupUnavailableReason(job));
   }
-  if (job.totpSecret || job.hasTotpCredential) {
+  if (!resetTotp && (job.totpSecret || job.hasTotpCredential)) {
     throw httpError(409, "该账号已经保存了 2FA 密钥，无需重复设置");
   }
-  if (job.totpKnownEnabled) {
+  if (!resetTotp && job.totpKnownEnabled) {
     throw httpError(409, "该账号已经启用 2FA，但本地没有它的原始密钥，无法重复创建");
   }
   const resumeAuthorization = !job.resultSaved;
@@ -1136,10 +1179,12 @@ async function startTotpSetup(job, options = {}) {
   job.totpSetupError = null;
   job.totpSetupAttempt = (job.totpSetupAttempt || 0) + 1;
   job.totpSetupResumesAuthorization = resumeAuthorization;
+  Object.assign(job, newLogoutAllDevicesState(logoutAllDevicesAfterTotp));
+  Object.assign(job, newTotpResetState(resetTotp));
   resetProxyRiskState(job);
   job.lastError = null;
   job.parserTail = "";
-  recordJobOperation(job, "setup_2fa");
+  recordJobOperation(job, resetTotp ? "reset_2fa" : "setup_2fa");
   appendJobLog(job, `\n[2fa] 开始第 ${job.totpSetupAttempt} 次 2FA 设置，原授权文件保持不变。\n`);
   enqueueJob(job, "totp_setup", "正在重新验证账号并准备设置 2FA");
 }
@@ -1269,15 +1314,268 @@ function restorePasswordAddFailure(job, message) {
   void saveJobMetadata(job).catch(() => {});
 }
 
+function normalizeLogoutAllDevicesOption(options = {}) {
+  if (!Object.hasOwn(options, "logoutAllDevicesAfterTotp")) return false;
+  if (typeof options.logoutAllDevicesAfterTotp !== "boolean") {
+    throw httpError(400, "logoutAllDevicesAfterTotp 必须是布尔值");
+  }
+  return options.logoutAllDevicesAfterTotp;
+}
+
+function normalizeResetTotpOption(options = {}) {
+  if (!Object.hasOwn(options, "resetTotp")) return false;
+  if (typeof options.resetTotp !== "boolean") throw httpError(400, "resetTotp 必须是布尔值");
+  return options.resetTotp;
+}
+
+function newTotpResetState(requested = false) {
+  return { resetTotp: requested, totpResetStatus: requested ? "pending" : "not_requested",
+    totpResetPhase: "initial", totpResetError: null, totpResetAttemptedAt: null,
+    totpCredentialInvalidated: false, totpResetAckRunId: null };
+}
+
+function totpResetMetadata(job) {
+  return { reset_totp_requested: job.resetTotp === true, reset_totp_status: job.totpResetStatus || "not_requested",
+    reset_totp_phase: job.totpResetPhase || "initial", reset_totp_error: job.totpResetError || null,
+    reset_totp_attempted_at: job.totpResetAttemptedAt || null,
+    totp_credential_invalidated: Boolean(job.totpCredentialInvalidated) };
+}
+
+function readTotpResetState(source = {}, fallback = {}, settled = false) {
+  const data = { ...fallback, ...source };
+  const requested = data.reset_totp_requested === true;
+  const statuses = ["pending", "disabling", "disabled", "activated", "failed", "unknown"];
+  let status = requested && statuses.includes(data.reset_totp_status) ? data.reset_totp_status
+    : requested ? "pending" : "not_requested";
+  if (settled && ["pending", "disabling", "disabled"].includes(status)) {
+    status = data.reset_totp_attempted_at || data.old_factor_invalidated ? "unknown" : "failed";
+  }
+  return { resetTotp: requested, totpResetStatus: status,
+    totpResetPhase: typeof data.reset_totp_phase === "string" ? data.reset_totp_phase : "initial",
+    totpResetError: typeof data.reset_totp_error === "string" ? sanitizeLog(data.reset_totp_error).slice(0, 500) : null,
+    totpResetAttemptedAt: typeof data.reset_totp_attempted_at === "string" ? data.reset_totp_attempted_at : null,
+    totpCredentialInvalidated: Boolean(data.totp_credential_invalidated
+      || (data.old_factor_invalidated && data.reset_totp_phase !== "credential_persisted")) };
+}
+
+function applyTotpResetResult(job, result, settled = false) {
+  Object.assign(job, readTotpResetState(result || {}, totpResetMetadata(job), settled));
+  if (job.totpCredentialCommitted) job.totpCredentialInvalidated = false;
+  if (job.totpCredentialInvalidated) {
+    job.totpSecret = "";
+    job.hasTotpCredential = false;
+    job.totpKnownEnabled = false;
+  }
+}
+
+function applyTotpResetCompletion(job) {
+  if (!job.resetTotp) return;
+  if (job.totpResetStatus === "activated" && job.totpCredentialCommitted) {
+    job.totpResetError = null;
+    if (!job.logoutAllDevicesCheckpointInvalidated) {
+      job.prompt = `2FA 已重置，新密钥已安全保存${job.logoutAllDevicesAfterTotp ? `；${totpLogoutResultText(job)}` : ""}`;
+    }
+    return;
+  }
+  job.status = "failed";
+  job.restartRequired = true;
+  job.totpResetError ||= "2FA 重置未完整完成，请手动核实账号状态并恢复有效密钥";
+  job.totpSetupError = job.totpResetError;
+  job.lastError = job.totpResetError;
+  job.prompt = "2FA 重置未完成，需要手动核实；不会自动重试移除或退出";
+  // A verified, persisted new key remains valid even when later workflow bookkeeping failed.
+  if (!job.totpCredentialCommitted && (job.totpResetAttemptedAt || job.totpCredentialInvalidated)) {
+    job.totpCredentialInvalidated = true;
+    job.totpSecret = "";
+    job.hasTotpCredential = false;
+  }
+}
+
+async function acknowledgeTotpResetState(job, child, runId) {
+  const isCurrent = () => !shuttingDown && !job.deleted && job.runId === runId && job.child === child
+    && job.runMode === "totp_setup" && job.resetTotp && isActive(job.status);
+  if (!isCurrent()) return;
+  job.totpResetAckRunId = runId;
+  let ok = false;
+  try {
+    const result = JSON.parse(await fs.readFile(job.totpResultPath, "utf8"));
+    if (result?.version !== 1 || result.operation_id !== runId || result.reset_totp_requested !== true
+      || String(result.email || "").toLowerCase() !== job.email.toLowerCase()
+      || result.reset_totp_phase !== "disable_intent" || result.reset_totp_status !== "disabling"
+      || result.old_factor_invalidated !== true) throw new Error("重置阶段与当前任务不匹配");
+    // Prove durable credential storage works before permitting removal of the old factor.
+    const existing = await credentialStore.load(job.email);
+    const credentials = { password: job.password || existing.password || "",
+      totpSecret: job.totpSecret || existing.totpSecret || "", proxyUrl: job.proxyUrl || existing.proxyUrl || "" };
+    await credentialStore.save(job.email, credentials);
+    const verified = await credentialStore.load(job.email);
+    if (["password", "totpSecret", "proxyUrl"].some((key) => (verified[key] || "") !== credentials[key])) {
+      throw new Error("凭据存储预检失败");
+    }
+    if (!isCurrent()) return;
+    applyTotpResetResult(job, result);
+    job.prompt = "正在重置 2FA；旧密钥已暂停自动使用";
+    await saveJobMetadata(job);
+    ok = true;
+  } catch {
+    job.totpResetError = "无法可靠保存重置阶段，已停止后续重置请求";
+  }
+  if (isCurrent()) sendTotpCredentialAck(child, runId, ok, "totp-reset-state-persisted");
+}
+
+function newLogoutAllDevicesState(requested = false) {
+  return {
+    logoutAllDevicesAfterTotp: requested,
+    logoutAllDevicesStatus: requested ? "pending" : "not_requested",
+    logoutAllDevicesError: null,
+    logoutAllDevicesAttemptedAt: null,
+    logoutAllDevicesCheckpointInvalidated: false,
+    totpCredentialCommitted: false,
+    totpCredentialAckRunId: null,
+    totpOperationId: null,
+    totpRecoveryPending: false,
+  };
+}
+
+function logoutAllDevicesMetadata(job) {
+  return {
+    logout_all_devices_requested: job.logoutAllDevicesAfterTotp === true,
+    logout_all_devices_status: job.logoutAllDevicesStatus || "not_requested",
+    logout_all_devices_error: job.logoutAllDevicesError || null,
+    logout_all_devices_attempted_at: job.logoutAllDevicesAttemptedAt || null,
+    logout_all_devices_checkpoint_invalidated: Boolean(job.logoutAllDevicesCheckpointInvalidated),
+  };
+}
+
+function readLogoutAllDevicesState(source = {}, fallback = {}, settled = false) {
+  const merged = { ...fallback, ...source };
+  const requested = merged.logout_all_devices_requested === true;
+  const statuses = ["not_requested", "pending", "succeeded", "failed", "unknown", "skipped"];
+  const attemptedAt = typeof merged.logout_all_devices_attempted_at === "string"
+    && Number.isFinite(Date.parse(merged.logout_all_devices_attempted_at))
+    ? merged.logout_all_devices_attempted_at : null;
+  let status = requested && statuses.includes(merged.logout_all_devices_status)
+    ? merged.logout_all_devices_status : requested ? "pending" : "not_requested";
+  if (requested && status === "not_requested") status = "pending";
+  if (settled && status === "pending") status = attemptedAt ? "unknown" : "skipped";
+  return {
+    logoutAllDevicesAfterTotp: requested,
+    logoutAllDevicesStatus: status,
+    logoutAllDevicesError: typeof merged.logout_all_devices_error === "string"
+      ? sanitizeLog(merged.logout_all_devices_error).slice(0, 500) : null,
+    logoutAllDevicesAttemptedAt: attemptedAt,
+    logoutAllDevicesCheckpointInvalidated: Boolean(merged.logout_all_devices_checkpoint_invalidated),
+  };
+}
+
+function applyTotpLogoutResult(job, result, settled = false) {
+  const state = readLogoutAllDevicesState(result || {}, logoutAllDevicesMetadata(job), settled);
+  if (result && (state.logoutAllDevicesAttemptedAt || ["succeeded", "unknown"].includes(state.logoutAllDevicesStatus))) {
+    state.logoutAllDevicesCheckpointInvalidated = true;
+  }
+  Object.assign(job, state);
+}
+
+function totpLogoutResultText(job) {
+  return {
+    pending: "退出请求尚未执行",
+    succeeded: "退出所有设备请求已提交",
+    failed: "退出所有设备请求失败",
+    unknown: "退出所有设备请求结果未知",
+    skipped: "尚未执行退出所有设备",
+  }[job.logoutAllDevicesStatus] || "";
+}
+
+async function applyTotpLogoutCheckpoint(job) {
+  if (!job.logoutAllDevicesCheckpointInvalidated) return;
+  job.loginCheckpointAvailable = false;
+  await removePrivateFile(job.checkpointPath);
+  if (!job.resultSaved) {
+    job.status = "reauth_required";
+    job.restartRequired = true;
+    job.lastError = "本次退出可能已使旧登录会话失效，请重新登录并授权";
+  }
+  job.prompt = `2FA 已激活；${totpLogoutResultText(job)}；${job.resultSaved
+    ? "历史授权文件已保留，令牌有效性未验证" : "继续授权需要重新登录"}`;
+}
+
+function sendTotpCredentialAck(child, runId, ok, type = "totp-credential-persisted") {
+  if (!child.connected) return;
+  try {
+    child.send({ type, operationId: runId, ok }, () => {});
+  } catch {}
+}
+
+async function acknowledgeTotpCredential(job, child, runId) {
+  const isCurrent = () => !shuttingDown && !job.deleted && job.runId === runId
+    && job.child === child && job.runMode === "totp_setup" && isActive(job.status)
+    && (job.logoutAllDevicesAfterTotp === true || job.resetTotp === true);
+  if (!isCurrent()) return;
+  if (job.totpCredentialAckRunId === runId) {
+    sendTotpCredentialAck(child, runId, Boolean(job.totpCredentialCommitted));
+    return;
+  }
+  job.totpCredentialAckRunId = runId;
+  let ok = false;
+  try {
+    const result = JSON.parse(await fs.readFile(job.totpResultPath, "utf8"));
+    if (result?.version !== 1 || result.activation_succeeded !== true
+      || result.operation_id !== runId
+      || String(result.email || "").toLowerCase() !== job.email.toLowerCase()
+      || (job.logoutAllDevicesAfterTotp && result.logout_all_devices_requested !== true)
+      || (job.resetTotp && (result.reset_totp_requested !== true || result.reset_totp_status !== "activated"
+        || result.activation_verified !== true || result.reset_totp_phase !== "activated_verified"))) {
+      throw new Error("激活结果与本次任务不匹配");
+    }
+    const secret = normalizeTotpSecret(result.secret);
+    job.totpSecret = secret;
+    job.hasTotpCredential = true;
+    job.totpKnownEnabled = true;
+    if (!await saveStoredLoginCredentials(job.email, { ...job, totpCredentialInvalidated: false })) throw new Error("当前系统不支持持久凭据存储");
+    const stored = await loadStoredLoginCredentials(job.email);
+    if (stored.totpSecret !== secret) throw new Error("凭据保存后的读取验证失败");
+    if (!isCurrent()) return;
+    applyTotpLogoutResult(job, result);
+    applyTotpResetResult(job, result);
+    job.totpSecret = secret;
+    job.hasTotpCredential = true;
+    job.totpKnownEnabled = true;
+    job.totpCredentialInvalidated = false;
+    if (job.resetTotp) job.totpResetPhase = "credential_persisted";
+    job.totpCredentialCommitted = true;
+    await saveJobMetadata(job);
+    ok = true;
+  } catch {
+    job.totpCredentialCommitted = false;
+    job.totpSetupError = "2FA 已激活，但密钥持久保存未确认；本次不会执行退出，结果文件已保留";
+    job.logoutAllDevicesError = "新密钥未完成可靠保存，退出已跳过";
+    if (job.resetTotp) {
+      job.totpCredentialInvalidated = true;
+      job.totpSecret = "";
+      job.hasTotpCredential = false;
+      job.totpResetError = "新 2FA 已激活但密钥持久保存未确认，请恢复私有结果中的新密钥";
+    }
+    touch(job);
+  }
+  if (isCurrent()) sendTotpCredentialAck(child, runId, ok);
+}
+
 async function loadTotpSetupResult(job) {
   const data = JSON.parse(await fs.readFile(job.totpResultPath, "utf8"));
   if (data?.version !== 1) throw new Error("2FA 设置结果文件格式不正确");
+  if (String(data.email || "").toLowerCase() !== job.email.toLowerCase()) {
+    throw new Error("2FA 设置结果与任务账号不匹配");
+  }
+  if ((job.resetTotp || job.logoutAllDevicesAfterTotp) && data.operation_id !== job.totpOperationId) {
+    throw new Error("2FA 设置结果与本次操作不匹配，恢复文件已保留");
+  }
   if (data.already_enabled) {
     job.totpKnownEnabled = true;
     job.totpSetupSecret = null;
     job.totpSetupUri = null;
     return data;
   }
+  if (data.reset_totp_requested === true && !data.secret) return data;
   const secret = normalizeTotpSecret(data.secret);
   const uri = String(data.otpauth_uri || "");
   if (!uri.startsWith("otpauth://totp/")) throw new Error("2FA 设置地址格式不正确");
@@ -1301,32 +1599,47 @@ async function finishTotpSetup(job, code, signal) {
   }
 
   const activationSucceeded = result?.activation_succeeded === true;
+  applyTotpLogoutResult(job, result, true);
+  applyTotpResetResult(job, result, true);
   let removeResult = false;
   if (code === 0 && result?.already_enabled) {
     job.totpKnownEnabled = true;
     job.prompt = "账号已经启用 2FA，但服务端不会返回原始密钥";
     job.totpSetupError = "如需自动登录，请重新导入这个账号原有的 2FA 密钥";
     removeResult = true;
-  } else if ((code === 0 || activationSucceeded) && result?.secret) {
+  } else if ((activationSucceeded || (!job.resetTotp && code === 0)) && result?.secret) {
     const secret = normalizeTotpSecret(result.secret);
     job.totpSecret = secret;
     job.hasTotpCredential = true;
     job.totpKnownEnabled = true;
-    const persisted = await saveStoredLoginCredentials(job.email, job);
+    let persisted = job.totpCredentialCommitted || await saveStoredLoginCredentials(job.email, { ...job, totpCredentialInvalidated: false });
+    if (persisted && (job.resetTotp || job.logoutAllDevicesAfterTotp) && !job.totpCredentialCommitted) {
+      persisted = (await loadStoredLoginCredentials(job.email)).totpSecret === secret;
+    }
+    if (persisted && (!job.resetTotp || result.activation_verified === true)) {
+      job.totpCredentialInvalidated = false;
+      job.totpCredentialCommitted = true;
+    } else if (job.resetTotp) {
+      job.totpCredentialInvalidated = true;
+      job.totpSecret = "";
+      job.hasTotpCredential = false;
+    }
     job.prompt = activationSucceeded && code !== 0
       ? "2FA 已激活并保存，但最终状态确认未完成"
       : resumeAuthorization
         ? "2FA 已设置并安全保存，可以继续未完成的 Codex 授权"
         : "2FA 已设置并安全保存，可以继续下载或重新授权";
     job.totpSetupError = !persisted
-      ? "当前系统不支持持久凭据存储，2FA 密钥已保留在私有结果文件中，请不要删除该任务目录"
+      ? "密钥持久保存未确认，2FA 密钥已保留在私有结果文件中，请不要删除该任务目录"
       : activationSucceeded && code !== 0
       ? "激活接口已返回成功，但后续确认请求失败；密钥已保留"
       : null;
-    appendJobLog(job, persisted
+    appendJobLog(job, job.resetTotp && result.activation_verified !== true
+      ? "[2fa] 新密钥已保留，重置最终状态未确认；暂停自动使用并等待手动核实。\n"
+      : persisted
       ? "[2fa] 2FA 设置成功，密钥已写入系统凭据存储，未写入协议日志。\n"
       : "[2fa] 2FA 设置成功，但当前系统不支持持久凭据存储；密钥已保留在私有结果文件中。\n");
-    removeResult = persisted;
+    removeResult = persisted && (!job.resetTotp || (result.activation_verified === true && result.reset_totp_status === "activated"));
   } else {
     job.prompt = resumeAuthorization
       ? "本次 2FA 设置未完成，原登录检查点仍可继续"
@@ -1345,11 +1658,20 @@ async function finishTotpSetup(job, code, signal) {
   job.totpSetupSecret = null;
   job.totpSetupUri = null;
   job.totpSetupResumesAuthorization = false;
-  if (removeResult || !result?.secret || result?.activation_succeeded === false) {
+  if (job.logoutAllDevicesAfterTotp && !job.logoutAllDevicesCheckpointInvalidated) {
+    job.prompt += `；${totpLogoutResultText(job)}`;
+  }
+  await applyTotpLogoutCheckpoint(job);
+  applyTotpResetCompletion(job);
+  job.totpRecoveryPending = Boolean(result?.secret && !removeResult)
+    || Boolean(job.resetTotp && job.totpCredentialInvalidated);
+  touch(job);
+  // Commit non-secret results before deleting the only crash-recovery copy.
+  await saveJobMetadata(job);
+  if (removeResult || (result && !job.resetTotp && !job.logoutAllDevicesAfterTotp
+    && (!result.secret || result.activation_succeeded === false))) {
     await removePrivateFile(job.totpResultPath);
   }
-  touch(job);
-  await saveJobMetadata(job);
 }
 
 async function removePrivateFile(filePath) {
@@ -1361,7 +1683,18 @@ async function removePrivateFile(filePath) {
   }
 }
 
+async function assertNoPendingTotpRecovery(job) {
+  let result;
+  try { result = JSON.parse(await fs.readFile(job.totpResultPath, "utf8")); }
+  catch (error) { if (error?.code === "ENOENT") return; throw httpError(409, "2FA 恢复文件尚未安全处理，请先恢复任务"); }
+  if (result?.secret || result?.reset_totp_attempted_at) {
+    throw httpError(409, "存在未完成保存的 2FA 恢复结果，请先恢复密钥，不能覆盖或删除该结果");
+  }
+}
+
 function restoreTotpSetupFailure(job, message) {
+  applyTotpLogoutResult(job, null, true);
+  applyTotpResetResult(job, null, true);
   const resumeAuthorization = Boolean(job.totpSetupResumesAuthorization);
   job.status = resumeAuthorization ? "resume_available" : "completed";
   job.prompt = resumeAuthorization
@@ -1375,7 +1708,7 @@ function restoreTotpSetupFailure(job, message) {
   job.runMode = null;
   job.child?.kill("SIGTERM");
   job.child = null;
-  void removePrivateFile(job.totpResultPath).catch(() => {});
+  applyTotpResetCompletion(job);
   touch(job);
   void saveJobMetadata(job).catch(() => {});
 }
@@ -1436,6 +1769,7 @@ function consumeOutput(job, rawText) {
     || scan.includes("[checkpoint] Updated verified login state after adding the password.")
     || scan.includes("[checkpoint] Updated verified login state after setting 2FA.")) {
     job.loginCheckpointAvailable = true;
+    if (job.runMode === "full") job.logoutAllDevicesCheckpointInvalidated = false;
   }
 
   const riskErrors = [...scan.matchAll(/\[proxy-risk-retry\]\s*([^\r\n]*)[\r\n]/g)];
@@ -1653,6 +1987,11 @@ function consumeOutput(job, rawText) {
 
 async function restartAfterProxyRisk(job, options = {}) {
   if (job.proxyRiskRestarting || isTerminalStatus(job.status) || job.deleted || shuttingDown) return;
+  if (job.runMode === "totp_setup" && (job.totpResetAckRunId
+    || (job.logoutAllDevicesAfterTotp && job.totpCredentialAckRunId))) {
+    // Once activation reached the persistence handshake, never re-enroll or replay logout.
+    return;
+  }
   job.proxyRiskRestarting = true;
   const mode = job.runMode || job.queuedMode || "full";
   const direct = !job.proxyUrl;
@@ -2237,12 +2576,29 @@ async function submitJobInput(job, body, options = {}) {
   touch(job);
 }
 
+async function stopTotpChild(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise((resolve, reject) => {
+    let forceTimer;
+    let timeout;
+    const closed = () => { clearTimeout(forceTimer); clearTimeout(timeout); resolve(); };
+    child.once("close", closed);
+    forceTimer = setTimeout(() => child.kill("SIGKILL"), 2_000);
+    timeout = setTimeout(() => {
+      child.removeListener("close", closed);
+      clearTimeout(forceTimer);
+      reject(new Error("2FA 进程尚未停止，已保留恢复文件，请稍后重新核实任务状态"));
+    }, 5_000);
+    child.kill("SIGTERM");
+  });
+}
+
 async function cancelJob(job) {
   if (!isActive(job.status)) return;
   if (job.runMode === "totp_setup" || job.queuedMode === "totp_setup") {
     stopMailPolling(job);
     job.runId = crypto.randomUUID();
-    job.child?.kill("SIGTERM");
+    await stopTotpChild(job.child);
     job.child = null;
     await finishTotpSetup(job, 1, "SIGTERM");
     if (!job.totpKnownEnabled) {
@@ -2818,6 +3174,7 @@ function isAutoRepairCoolingDown(job) {
 }
 
 function getAutoRepairEligibility(job) {
+  if (job.totpCredentialInvalidated || job.totpRecoveryPending) return { eligible: false, reason: "2FA 恢复状态需手动核实，已暂停自动使用密钥" };
   if (job.autoRepairBlocked) return { eligible: false, reason: "账号已确认封禁、删除或永久停用" };
   if (!job.lastAuthAutomated) return { eligible: false, reason: job.lastAuthAutomationReason || "上次授权不是全自动完成" };
   const requirements = job.lastAuthRequirements || {};
@@ -2916,48 +3273,126 @@ async function finishSub2ApiAutoRepairFailure(job) {
   await saveJobMetadata(job);
 }
 
+function assertAccountSourceAvailable(job) {
+  if (job.deleted || jobs.get(job.id) !== job) throw httpError(404, "账号任务已删除，请刷新列表");
+  const email = String(job.email || "").trim().toLowerCase();
+  for (const related of jobs.values()) {
+    if (related.deleted || String(related.email || "").trim().toLowerCase() !== email) continue;
+    if (related.totpCredentialInvalidated || related.totpRecoveryPending) {
+      throw httpError(409, "该邮箱的 2FA 恢复状态尚未确认，请先恢复有效密钥，不能将旧密钥作为当前凭据查看或导出");
+    }
+    if (["totp_setup", "password_add"].includes(related.runMode)
+      || (isActive(related.status) && ["totp_setup", "password_add"].includes(related.queuedMode))) {
+      throw httpError(409, "该邮箱的账号安全信息正在更新，请等待本次操作结束后再查看或导出");
+    }
+  }
+}
+
+async function readAccountSource(job) {
+  return withEmailJobLock(job.email, async () => {
+    assertAccountSourceAvailable(job);
+    let storedCredentials = { password: "", totpSecret: "" };
+    const email = String(job.email || "").trim().toLowerCase();
+    const related = [...jobs.values()].filter((entry) => !entry.deleted
+      && String(entry.email || "").trim().toLowerCase() === email);
+    const requiresPassword = related.some((entry) => entry.password || entry.hasPasswordCredential || entry.loginMode === "password");
+    const requiresTotp = related.some((entry) => entry.totpSecret || entry.hasTotpCredential);
+    let loadedPayload = false;
+    try {
+      const stored = await credentialStore.load(job.email);
+      loadedPayload = true;
+      if (!stored || typeof stored !== "object") throw new Error("unavailable");
+      storedCredentials = {
+        password: typeof stored.password === "string" ? stored.password : "",
+        totpSecret: stored.totpSecret ? normalizeTotpSecret(stored.totpSecret) : "",
+      };
+    } catch {
+      if (requiresPassword || requiresTotp || loadedPayload) {
+        throw httpError(409, "无法从系统安全凭据存储读取当前账号资料，请恢复凭据后重试");
+      }
+    }
+    // Read the current persisted key, never a cached pre-reset key from the UI.
+    assertAccountSourceAvailable(job);
+    const { password, totpSecret } = storedCredentials;
+    if (requiresPassword && !password) {
+      throw httpError(409, `${job.email} 的密码未能从系统安全凭据存储读取，请重新导入该账号资料`);
+    }
+    if (requiresTotp && !totpSecret) {
+      throw httpError(409, `${job.email} 的 2FA 密钥未能从系统安全凭据存储读取，请重新导入该账号资料`);
+    }
+    const account = {
+      email: job.email, password, totpSecret,
+      mailApiUrl: job.mailApiUrl || null, mailRequestBody: job.mailRequestBody || "",
+      loginMode: job.loginMode || (password ? "password" : job.mailApiUrl ? "email_otp" : "manual"),
+    };
+    return { account, job, revision: accountSourceRevision(job) };
+  });
+}
+
+function accountSourceRevision(job) {
+  // This in-memory snapshot is never returned to the client or written to logs.
+  const email = String(job.email || "").trim().toLowerCase();
+  const related = [...jobs.values()].filter((entry) => !entry.deleted
+    && String(entry.email || "").trim().toLowerCase() === email).sort((left, right) => left.id.localeCompare(right.id));
+  return JSON.stringify(related.map((entry) => [entry.id, entry.email, entry.password, entry.totpSecret, entry.mailApiUrl,
+    entry.mailRequestBody, entry.loginMode, entry.hasPasswordCredential, entry.hasTotpCredential,
+    entry.passwordAddedAt, entry.totpSetupAttempt, entry.totpCredentialAckRunId, entry.totpResetAckRunId]));
+}
+
+function assertAccountSourceSnapshotCurrent(snapshot) {
+  assertAccountSourceAvailable(snapshot.job);
+  if (snapshot.revision !== accountSourceRevision(snapshot.job)) {
+    throw httpError(409, "账号资料在读取期间发生变化，请重试查看或导出");
+  }
+}
+
+function accountSourceVersion(job) {
+  const email = String(job.email || "").trim().toLowerCase();
+  const related = [...jobs.values()].filter((entry) => !entry.deleted
+    && String(entry.email || "").trim().toLowerCase() === email).sort((left, right) => left.id.localeCompare(right.id));
+  // Public invalidation signal: no credential values or hashes of credential values.
+  return JSON.stringify(related.map((entry) => [entry.id, entry.status, entry.updatedAt || null,
+    entry.runMode || null, entry.queuedMode || null, Boolean(entry.totpCredentialInvalidated),
+    Boolean(entry.totpRecoveryPending), entry.totpResetStatus || "not_requested"]));
+}
+
 async function exportSourceAccounts(res, ids) {
   const selected = resolveSelectedJobs(ids);
   const lines = [];
+  const snapshots = [];
   for (const job of selected) {
-    let password = job.password || "";
-    let totpSecret = job.totpSecret || "";
-    if ((!password && job.hasPasswordCredential) || (!totpSecret && job.hasTotpCredential)) {
-      const storedCredentials = await loadStoredLoginCredentials(job.email);
-      password ||= storedCredentials.password;
-      totpSecret ||= storedCredentials.totpSecret;
-    }
-    if ((job.loginMode === "password" || job.hasPasswordCredential) && !password) {
-      throw httpError(409, `${job.email} 的密码未能从系统安全凭据存储读取，请重新导入该账号资料`);
-    }
-    if (job.hasTotpCredential && !totpSecret) {
-      throw httpError(409, `${job.email} 的 2FA 密钥未能从系统安全凭据存储读取，请重新导入该账号资料`);
-    }
+    const snapshot = await readAccountSource(job);
+    snapshots.push(snapshot);
+    const { account } = snapshot;
+    const { email, password, totpSecret, mailRequestBody, mailApiUrl, loginMode } = account;
     if (password) {
-      const parts = [job.email, password];
-      if (job.mailRequestBody) parts.push(job.mailRequestBody);
-      else if (job.mailApiUrl) parts.push(job.mailApiUrl);
+      const parts = [email, password];
+      if (mailRequestBody) parts.push(mailRequestBody);
+      else if (mailApiUrl) parts.push(mailApiUrl);
       if (totpSecret) parts.push(totpSecret);
       lines.push(parts.join("----"));
       continue;
     }
-    if (job.mailRequestBody) {
+    if (mailRequestBody) {
       lines.push(totpSecret
-        ? `${job.email}----${job.mailRequestBody}----${totpSecret}`
-        : `${job.email}----${job.mailRequestBody}`);
+        ? `${email}----${mailRequestBody}----${totpSecret}`
+        : `${email}----${mailRequestBody}`);
       continue;
     }
-    if (job.mailApiUrl) {
+    if (mailApiUrl) {
       lines.push(totpSecret
-        ? `${job.email}----${job.mailApiUrl}----${totpSecret}`
-        : `${job.email}----${job.mailApiUrl}`);
+        ? `${email}----${mailApiUrl}----${totpSecret}`
+        : `${email}----${mailApiUrl}`);
       continue;
     }
-    if (job.loginMode === "manual") {
+    if (loginMode === "manual") {
       throw httpError(409, `${job.email} 是旧版本任务，原始登录资料未保存，请重新导入该账号资料后再导出`);
     }
-    lines.push(totpSecret ? `${job.email}--------${totpSecret}` : job.email);
+    lines.push(totpSecret ? `${email}--------${totpSecret}` : email);
   }
+  // A prior row may have changed while a later row awaited its credential read.
+  // Do the last validation and write without yielding between them.
+  snapshots.forEach(assertAccountSourceSnapshotCurrent);
   const payload = Buffer.from(`\uFEFF${lines.join("\n")}\n`, "utf8");
   res.writeHead(200, {
     "content-type": "text/plain; charset=utf-8",
@@ -2987,6 +3422,9 @@ function publicJob(job) {
     canDownload: Boolean(job.resultSaved),
     loginMode: job.loginMode || (job.mailApiUrl ? "email_otp" : "manual"),
     hasTotpKey: Boolean(job.totpSecret || job.hasTotpCredential),
+    totpCredentialInvalidated: Boolean(job.totpCredentialInvalidated),
+    totpRecoveryPending: Boolean(job.totpRecoveryPending),
+    accountSourceVersion: accountSourceVersion(job),
     autoEmailOtp: Boolean(job.mailApiUrl),
     mailStatus: job.mailStatus,
     mailApiError: job.mailApiError,
@@ -2995,6 +3433,15 @@ function publicJob(job) {
     totpSetupSecret: job.status === "totp_setup_otp" ? job.totpSetupSecret : null,
     totpSetupUri: job.status === "totp_setup_otp" ? job.totpSetupUri : null,
     totpSetupError: job.totpSetupError || null,
+    logoutAllDevicesAfterTotp: job.logoutAllDevicesAfterTotp === true,
+    logoutAllDevicesStatus: job.logoutAllDevicesStatus || "not_requested",
+    logoutAllDevicesError: job.logoutAllDevicesError || null,
+    totpSetupUnavailableReason: totpSetupUnavailableReason(job),
+    canResetTotp: canResetTotp(job),
+    totpResetUnavailableReason: totpResetUnavailableReason(job),
+    resetTotp: job.resetTotp === true,
+    totpResetStatus: job.totpResetStatus || "not_requested",
+    totpResetError: job.totpResetError || null,
     passwordAddError: job.passwordAddError || null,
     passwordAddedAt: job.passwordAddedAt || null,
     smsProviderId: job.smsProviderId,
@@ -3003,9 +3450,9 @@ function publicJob(job) {
     smsStatus: job.smsStatus,
     smsError: job.smsError,
     securityCheckRequired: Boolean(job.securityCheckRequired),
-    canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
+    canRetry: canRetryJob(job),
     canResume: job.status === "resume_available",
-    canRegenerate: job.status === "completed" && job.resultSaved,
+    canRegenerate: job.status === "completed" && job.resultSaved && !job.totpCredentialInvalidated && !job.totpRecoveryPending,
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
     canAddPassword: canAddPassword(job),
@@ -3029,23 +3476,56 @@ function publicSelectionJob(job) {
     email: job.email,
     status: job.status,
     canDownload: Boolean(job.resultSaved),
-    canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
-    canRegenerate: job.status === "completed" && job.resultSaved,
+    canRetry: canRetryJob(job),
+    canRegenerate: job.status === "completed" && job.resultSaved && !job.totpCredentialInvalidated && !job.totpRecoveryPending,
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
+    totpSetupUnavailableReason: totpSetupUnavailableReason(job),
+    canResetTotp: canResetTotp(job),
+    totpResetUnavailableReason: totpResetUnavailableReason(job),
     canAddPassword: canAddPassword(job),
   };
 }
 
 function canForceRelogin(job) {
-  return ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
+  return !job.totpCredentialInvalidated && !job.totpRecoveryPending
+    && ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
+}
+
+function canRetryJob(job) {
+  return !job.totpCredentialInvalidated && !job.totpRecoveryPending
+    && ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
 }
 
 function canSetupTotp(job) {
-  if (job.totpSecret || job.hasTotpCredential || job.totpKnownEnabled) return false;
-  if (job.status === "completed" && job.resultSaved) return true;
-  return Boolean(job.loginCheckpointAvailable)
-    && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required"].includes(job.status);
+  return !totpSetupUnavailableReason(job);
+}
+
+function totpSetupUnavailableReason(job) {
+  if (job.totpRecoveryPending) return "2FA 密钥恢复尚未完成，请先恢复有效密钥";
+  if (job.totpCredentialInvalidated) return "2FA 重置尚未完成，请先手动核实并恢复有效密钥";
+  if (job.totpSecret || job.hasTotpCredential) return "已保存 2FA 密钥；设置按钮仅用于首次启用，更换密钥请使用重置 2FA";
+  if (job.totpKnownEnabled) return "账号已启用 2FA；更换密钥请使用重置 2FA";
+  if (job.status === "completed" && job.resultSaved) return "";
+  if (job.loginCheckpointAvailable && !job.logoutAllDevicesCheckpointInvalidated
+    && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required"].includes(job.status)) return "";
+  if (isActive(job.status)) return "请等待当前任务完成，或完成邮箱登录验证后再设置 2FA";
+  return "尚无可用的登录检查点，请先重新登录或完成授权";
+}
+
+function canResetTotp(job) {
+  return !totpResetUnavailableReason(job);
+}
+
+function totpResetUnavailableReason(job) {
+  if (job.totpRecoveryPending) return "存在尚未安全处理的 2FA 恢复结果，请先恢复有效密钥";
+  if (job.totpCredentialInvalidated) return "上次 2FA 重置状态未确认，请先手动核实并恢复有效密钥";
+  if (!(job.totpSecret || job.hasTotpCredential || job.totpKnownEnabled)) return "尚未确认账号已启用 2FA，请使用首次设置";
+  if (job.status === "completed" && job.resultSaved) return "";
+  if (job.loginCheckpointAvailable && !job.logoutAllDevicesCheckpointInvalidated
+    && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required"].includes(job.status)) return "";
+  if (isActive(job.status)) return "请等待当前任务结束后再重置 2FA";
+  return "缺少可用登录状态，请先重新登录或完成授权";
 }
 
 function canAddPassword(job) {
@@ -3361,6 +3841,7 @@ async function syncCompletedOutputs(force = false) {
           securityCheckRequired: Boolean(metadata.security_check_required),
           ...newSmsState(),
         });
+        await finalizeRestoredTotpJob(jobs.get(entry.name), totpRecovery);
         return;
       } catch {}
 
@@ -3454,18 +3935,24 @@ async function syncCompletedOutputs(force = false) {
           securityCheckRequired: Boolean(metadata.security_check_required),
           ...restoredSmsState(metadata),
         });
+        await finalizeRestoredTotpJob(jobs.get(entry.name), totpRecovery);
       } catch {
         if (
           !metadata.email
           || !isEmail(metadata.email)
         ) return;
-        const storedCredentials = await loadStoredLoginCredentials(metadata.email);
+        let storedCredentials = await loadStoredLoginCredentials(metadata.email);
+        const totpRecovery = await recoverActivatedTotpCredential({
+          email: metadata.email, resultPath: totpResultPath, credentials: storedCredentials,
+        });
+        storedCredentials = totpRecovery.credentials;
         const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
         const restoredAt = metadata.updated_at || new Date().toISOString();
         const missingStoredCredentials = restoredMissingCredentials(metadata, storedCredentials);
         const storedCredentialsMissing = missingStoredCredentials.length > 0;
         const savedStatus = String(metadata.status || "");
-        const restartable = ["queued", "starting"].includes(savedStatus);
+        const restartable = ["queued", "starting"].includes(savedStatus)
+          && metadata.queued_mode !== "totp_setup" && !metadata.totp_credential_invalidated;
         const interrupted = Boolean(savedStatus) && !isTerminalStatus(savedStatus) && !restartable;
         const restoredStatus = storedCredentialsMissing && restartable
           ? "reauth_required"
@@ -3548,6 +4035,7 @@ async function syncCompletedOutputs(force = false) {
           securityCheckRequired: Boolean(metadata.security_check_required),
           ...newSmsState(),
         });
+        await finalizeRestoredTotpJob(jobs.get(entry.name), totpRecovery);
       }
     }));
   })().finally(() => {
@@ -3564,28 +4052,64 @@ async function recoverActivatedTotpCredential({ email, resultPath, credentials }
     if (error?.code === "ENOENT") return { credentials, recovered: false, error: null };
     return { credentials, recovered: false, error: `2FA 结果文件无法读取：${error.message}` };
   }
+  if (result?.version !== 1 || String(result.email || "").toLowerCase() !== email.toLowerCase()) {
+    return { credentials, recovered: false, error: "2FA 恢复结果与账号不匹配，结果文件已保留" };
+  }
   if (result?.activation_succeeded !== true || !result?.secret) {
-    return { credentials, recovered: false, error: null };
+    return { credentials, recovered: false, error: null, result };
   }
   try {
     const secret = normalizeTotpSecret(result.secret);
     const nextCredentials = { ...credentials, totpSecret: secret };
-    const persisted = await saveStoredLoginCredentials(email, nextCredentials);
+    let persisted = await saveStoredLoginCredentials(email, nextCredentials);
+    if (persisted && (result.reset_totp_requested || result.logout_all_devices_requested)) {
+      persisted = (await loadStoredLoginCredentials(email)).totpSecret === secret;
+    }
     if (!persisted) {
       return {
         credentials: nextCredentials,
+        result,
         recovered: false,
         error: "2FA 已激活，但当前系统不支持持久凭据存储；结果文件已保留",
       };
     }
-    await removePrivateFile(resultPath);
-    return { credentials: nextCredentials, recovered: true, error: null };
+    return { credentials: nextCredentials, recovered: true, error: null, result };
   } catch (error) {
     return {
       credentials,
+      result,
       recovered: false,
       error: `2FA 已激活，但密钥恢复失败：${error.message}；结果文件已保留`,
     };
+  }
+}
+
+async function finalizeRestoredTotpJob(job, recovery) {
+  applyTotpLogoutResult(job, recovery?.result, true);
+  applyTotpResetResult(job, recovery?.result, true);
+  const resetVerified = recovery?.result?.activation_verified === true;
+  const resetComplete = resetVerified && recovery?.result?.reset_totp_status === "activated";
+  job.totpCredentialCommitted = Boolean(recovery?.recovered && (!job.resetTotp || resetVerified))
+    || Boolean(!recovery?.result && job.totpResetPhase === "credential_persisted"
+      && !job.totpCredentialInvalidated && job.totpSecret);
+  if (job.totpCredentialCommitted) {
+    job.totpCredentialInvalidated = false;
+    job.totpSecret = recovery?.credentials?.totpSecret || job.totpSecret;
+    job.hasTotpCredential = Boolean(job.totpSecret);
+    job.totpKnownEnabled = Boolean(job.totpSecret);
+    if (job.resetTotp) job.totpResetPhase = "credential_persisted";
+  }
+  if (recovery?.error) job.totpSetupError = recovery.error;
+  await applyTotpLogoutCheckpoint(job);
+  applyTotpResetCompletion(job);
+  job.totpRecoveryPending = Boolean(recovery?.result?.secret && (!recovery.recovered || (job.resetTotp && !resetComplete)))
+    || Boolean(job.resetTotp && job.totpCredentialInvalidated)
+    || Boolean(!recovery?.result && job.totpRecoveryPending);
+  if (recovery?.result || job.logoutAllDevicesAfterTotp || job.resetTotp) {
+    await saveJobMetadata(job);
+  }
+  if (recovery?.recovered && (!job.resetTotp || resetComplete)) {
+    await removePrivateFile(job.totpResultPath);
   }
 }
 
@@ -3776,6 +4300,11 @@ function restoredCredentialFlags(metadata = {}, credentials = {}) {
 
 function restoredTotpSetupState(metadata = {}, credentials = {}) {
   return {
+    ...newTotpResetState(),
+    ...readTotpResetState(metadata, {}, true),
+    ...newLogoutAllDevicesState(),
+    ...readLogoutAllDevicesState(metadata, {}, true),
+    totpRecoveryPending: metadata.totp_recovery_pending === true,
     totpSetupSecret: null,
     totpSetupUri: null,
     totpSetupError: null,
@@ -4252,6 +4781,9 @@ function escapeRegExp(value) {
 }
 
 async function updateJobCredentials(job, credentials, options = {}) {
+  if (job.runMode === "totp_setup" && (job.totpResetAckRunId || job.totpCredentialAckRunId)) {
+    throw httpError(409, "2FA 安全操作正在执行，请先等待完成或取消，不能同时修改账号资料");
+  }
   if (credentials.preserveExistingCredentials) await reloadMissingJobCredentials(job);
   const normalized = credentials.preserveExistingCredentials
     ? normalizeLoginCredentials({
@@ -4268,7 +4800,23 @@ async function updateJobCredentials(job, credentials, options = {}) {
     || job.password !== normalized.password
     || job.totpSecret !== normalized.totpSecret
     || job.proxyUrl !== nextProxyUrl;
-  await saveStoredLoginCredentials(job.email, { ...normalized, proxyUrl: nextProxyUrl });
+  await saveStoredLoginCredentials(job.email, { ...normalized, proxyUrl: nextProxyUrl,
+    totpCredentialInvalidated: job.totpCredentialInvalidated
+      && (credentials.preserveExistingCredentials || !normalized.totpSecret) });
+  if (normalized.totpSecret && !credentials.preserveExistingCredentials) {
+    if ((await loadStoredLoginCredentials(job.email)).totpSecret !== normalized.totpSecret) {
+      throw httpError(409, "新密钥尚未可靠保存，已保留原恢复资料");
+    }
+    if (await fileExists(job.totpResultPath)) {
+      await fs.rename(job.totpResultPath, `${job.totpResultPath}.resolved-${crypto.randomUUID()}`);
+    }
+    job.totpCredentialInvalidated = false;
+    job.resetTotp = false;
+    job.totpRecoveryPending = false;
+    job.totpResetStatus = "not_requested";
+    job.totpResetError = null;
+    job.totpSetupError = null;
+  }
   if (!changed) return;
   stopMailPolling(job);
   job.loginMode = normalized.loginMode;
@@ -4356,6 +4904,9 @@ async function saveJobMetadata(job) {
         has_password: Boolean(job.password || job.hasPasswordCredential),
         has_totp_key: Boolean(job.totpSecret || job.hasTotpCredential),
         totp_known_enabled: Boolean(job.totpKnownEnabled || job.totpSecret || job.hasTotpCredential),
+        ...logoutAllDevicesMetadata(job),
+        ...totpResetMetadata(job),
+        totp_recovery_pending: Boolean(job.totpRecoveryPending),
         password_add_error: job.passwordAddError || null,
         password_added_at: job.passwordAddedAt || null,
         login_checkpoint_available: Boolean(job.loginCheckpointAvailable),
@@ -4391,7 +4942,12 @@ async function saveJobMetadata(job) {
 
 async function saveStoredLoginCredentials(email, credentials = {}) {
   const password = typeof credentials.password === "string" ? credentials.password : "";
-  const totpSecret = credentials.totpSecret ? normalizeTotpSecret(credentials.totpSecret) : "";
+  let totpSecret = credentials.totpSecret ? normalizeTotpSecret(credentials.totpSecret) : "";
+  if (credentials.totpCredentialInvalidated) {
+    // Retain the encrypted old/new recovery key without permitting its automatic use.
+    const existing = await credentialStore.load(email);
+    totpSecret = existing.totpSecret || "";
+  }
   const proxyUrl = credentials.proxyUrl ? normalizeProxyUrl(credentials.proxyUrl) : "";
   if (!password && !totpSecret && !proxyUrl) {
     await deleteStoredLoginCredentials(email);

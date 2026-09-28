@@ -27,6 +27,9 @@ toSub2 是一个本地网页工具，通过协议请求完成 ChatGPT 登录和 
 - 支持手动邮箱验证码、邮箱收码 API（接口）自动取码。
 - 支持密码登录，以及密码或邮箱验证码登录后的 2FA（双重身份验证）。
 - 已完成 ChatGPT 登录的账号可以单个或批量创建新的 TOTP 2FA（基于时间的一次性密码），不要求先完成手机号绑定或 Codex 授权；程序会自动生成并提交激活验证码，密钥不会写入协议日志，设置完成后可继续原授权流程。
+- 已有 2FA 的账号可单个或批量重置：移除旧因子、创建并验证新密钥，再安全保存。每次设置或重置的确认窗口都可选择“成功后退出所有设备（仅本次）”；默认不勾选，每个账号只提交一次退出请求，不巡检、不自动重试。
+- 账号名下方直接提供“查看资料”和“导出账号资料”，支持查看、隐藏、复制当前保存的登录资料和批量导出；重置完成后导出新密钥。待恢复、已失效或正在修改的安全凭据不会作为有效资料导出。
+- 2FA 重置、一致性保护与专项测试说明见 [实现与验证记录](docs/2fa-reset-implementation.md)。
 - 无密码账号可以单个或批量添加随机强密码，已有密码的账号会自动跳过；支持邮箱 API 自动收码或手动输入验证码，成功后会更新本地账号原始信息。账号只要已保存邮箱登录检查点即可添加密码，不要求先完成手机号绑定或 Codex 授权；添加后可继续原授权流程。
 - 自动跳过已经完成手机号绑定的账号。
 - 未绑定账号支持手动手机号、手动短信验证码，以及 LubanSMS、SMSBower、自定义号码池自动取号收码。
@@ -47,7 +50,7 @@ toSub2 是一个本地网页工具，通过协议请求完成 ChatGPT 登录和 
 ## 安装与启动
 
 ```bash
-git clone https://github.com/poxiao33/toSub2.git
+git clone https://github.com/Cengyj/toSub2.git
 cd toSub2
 npm install
 python -m pip install -r requirements.txt
@@ -73,6 +76,21 @@ npm run dev -- --host 0.0.0.0
 ```
 
 局域网模式没有访问认证，只应在可信网络内短时间使用。
+
+### Windows 持久后台部署
+
+Windows 下可以使用原生计划任务，在关闭终端、退出 Codex 或切换项目后继续运行。首次部署：
+
+```powershell
+npm.cmd ci
+python -m venv .venv
+& '.\.venv\Scripts\python.exe' -m pip install -r requirements.txt
+npm.cmd run deploy:windows
+```
+
+安装后自动启动，访问 `http://127.0.0.1:4399/`。计划任务 `toSub2 Persistent Server` 在当前 Windows 用户登录时自启；应用退出后约 5 秒重新启动，守护进程退出后由每分钟的计划任务检查恢复。后台入口使用 `pythonw.exe`，Node 以 `CREATE_NO_WINDOW` 启动，避免创建黑色控制台窗口。进程树由 Windows Job Object 管理，停止服务时会一起清理 Node、Python 等子进程。无需保持 Codex 或命令行窗口打开。
+
+数据仍保存在项目的 `tmp/chatgpt-onboarding-console`；日志和部署配置位于 `%LOCALAPPDATA%\toSub2`。不要移动或删除部署目录。电脑关机或休眠期间服务不可用，重新登录后自动恢复。启动、停止、日志及本机验证记录见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
 ### PM2（Node.js 进程管理器）守护运行
 

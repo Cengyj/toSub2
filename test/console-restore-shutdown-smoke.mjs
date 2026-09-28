@@ -122,7 +122,19 @@ await fs.writeFile(path.join(interruptedTotpDir, "job-meta.json"), `${JSON.strin
   login_checkpoint_available: true,
 }, null, 2)}\n`);
 
+// Windows child.kill("SIGTERM") terminates Node without running signal handlers.
+// Deliver the same shutdown event cooperatively so this test still verifies
+// the real handler's request cancellation, metadata flush, and natural exit.
+const cooperativeShutdown = process.platform === "win32";
+const shutdownPreload = `data:text/javascript,${encodeURIComponent(`
+  process.once("message", (message) => {
+    if (message !== "tosub2-test-shutdown") throw new Error("Unexpected test IPC message");
+    process.disconnect();
+    if (!process.emit("SIGTERM")) throw new Error("Shutdown handler is not installed");
+  });
+`)}`;
 const child = spawn(process.execPath, [
+  ...(cooperativeShutdown ? ["--import", shutdownPreload] : []),
   path.join(projectRoot, "src", "console-server.mjs"),
   "--host", "127.0.0.1",
   "--port", String(port),
@@ -135,7 +147,7 @@ const child = spawn(process.execPath, [
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(tempRoot, "credentials"),
     TOSUB2_TLS_PROFILE: "chrome142",
   },
-  stdio: ["ignore", "pipe", "pipe"],
+  stdio: cooperativeShutdown ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
   windowsHide: true,
 });
 
@@ -205,10 +217,17 @@ try {
     delay(3_000).then(() => { throw new Error("monitor request did not start"); }),
   ]);
   const shutdownStartedAt = Date.now();
-  child.kill("SIGTERM");
+  if (cooperativeShutdown) {
+    await new Promise((resolve, reject) => {
+      child.send("tosub2-test-shutdown", (error) => error ? reject(error) : resolve());
+    });
+  } else {
+    child.kill("SIGTERM");
+  }
   const exit = await Promise.race([childExit, delay(10_000).then(() => null)]);
   assert.ok(exit, "console did not exit after SIGTERM");
   assert.equal(exit.code, 0, logs);
+  assert.equal(exit.signal, null, logs);
   assert.ok(Date.now() - shutdownStartedAt < 5_000, "shutdown should abort the pending Sub2API monitor request");
   const metadata = JSON.parse(await fs.readFile(path.join(outputRoot, created.job.id, "job-meta.json"), "utf8"));
   assert.equal(metadata.status, "canceled");

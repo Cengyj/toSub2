@@ -160,7 +160,10 @@ class ProtocolClient {
   }
 
   async rawFetch(url, options = {}) {
-    if (this.transport) return this.transport.fetch(url, { ...options, retryRiskControl: true });
+    if (this.transport) return this.transport.fetch(url, {
+      ...options,
+      retryRiskControl: options.singleAttempt === true ? false : (options.retryRiskControl ?? true),
+    });
     return fetch(url, options);
   }
 
@@ -168,7 +171,7 @@ class ProtocolClient {
     const targetUrl = new URL(url);
     const headers = new Headers(options.headers || {});
     for (const [name, value] of Object.entries(browserHeadersForTransport(this.transport))) {
-      headers.set(name, value);
+      if (options.defaultHeaders !== false || !headers.has(name)) headers.set(name, value);
     }
     if (options.userAgent) headers.set("user-agent", options.userAgent);
 
@@ -201,6 +204,7 @@ class ProtocolClient {
       headers.set("content-type", "application/x-www-form-urlencoded");
       body = new URLSearchParams(options.form).toString();
     }
+    for (const name of options.omitHeaders || []) headers.delete(name);
 
     if (this.verbose) {
       console.error(`> ${method} ${safeUrl(url)}`);
@@ -218,6 +222,9 @@ class ProtocolClient {
         redirect: "manual",
         signal: controller.signal,
         timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS,
+        singleAttempt: options.singleAttempt,
+        defaultHeaders: options.defaultHeaders,
+        omitHeaders: options.omitHeaders,
       });
       this.jar.setFromResponse(url, res.headers);
       this.jar.merge(res.headers.transportCookies);
@@ -237,7 +244,7 @@ class ProtocolClient {
       console.error(`< ${method} ${safeUrl(url)} ${res.status}${suffix}`);
     }
 
-    if (isRiskControlResponse(res, text)) {
+    if (options.singleAttempt !== true && isRiskControlResponse(res, text)) {
       throw new Error(
         `PROXY_RISK_CONTROL: ${method} ${safeUrl(url)} returned HTTP ${res.status} with a security-check page`,
       );
@@ -282,6 +289,16 @@ async function run() {
     printHelp();
     return;
   }
+  if (args.logoutAllDevicesAfterTotp && (!args.setupTotp || args.addPassword || args.refreshSub2api)) {
+    throw new Error("--logout-all-devices-after-totp requires --setup-totp and cannot run independently");
+  }
+  if (args.resetTotp && (!args.setupTotp || args.addPassword || args.refreshSub2api)) {
+    throw new Error("--reset-totp requires --setup-totp and cannot run independently");
+  }
+  if (args.resetTotp && (!process.env.TOSUB2_TOTP_OPERATION_ID || typeof process.send !== "function" || !process.connected)) {
+    throw new Error("TOTP_RESET_PRECHECK_FAILED: Reset requires the parent credential-persistence channel; no settings were changed.");
+  }
+  if (args.setupTotp) await assertTotpOperationNotPreviouslyAttempted(path.resolve(args.totpResult || DEFAULT_TOTP_RESULT));
 
   const chatgptBase = trimSlash(args.chatgptBase || process.env.CHATGPT_BASE || DEFAULT_CHATGPT_BASE);
   const authBase = trimSlash(args.authBase || process.env.AUTH_BASE || DEFAULT_AUTH_BASE);
@@ -417,6 +434,7 @@ async function run() {
       try {
         let client = null;
         let web = null;
+        let setupResult = null;
         let email = args.email || "";
         const checkpointPath = args.resumeCheckpoint ? path.resolve(args.resumeCheckpoint) : null;
         if (checkpointPath) {
@@ -444,15 +462,18 @@ async function run() {
         if (!email) throw new Error("Email is required");
         if (client) {
           try {
-            await setupChatgptTotp(client, {
+            setupResult = await setupChatgptTotp(client, {
               chatgptBase,
               email,
               rl,
               deviceId: web?.deviceId || client.jar.value("oai-did", `${chatgptBase}/`) || crypto.randomUUID(),
               resultPath,
+              logoutAllDevicesAfterTotp: Boolean(args.logoutAllDevicesAfterTotp),
+              resetTotp: Boolean(args.resetTotp),
+              checkpointPath,
             });
           } catch (error) {
-            if (!isExpiredCheckpointError(error)) throw error;
+            if (error?.preventTotpRetry || !isExpiredCheckpointError(error)) throw error;
             console.log("[2fa] Saved login state expired; falling back to a fresh account login.");
             client = null;
           }
@@ -468,12 +489,15 @@ async function run() {
             password: process.env.CHATGPT_LOGIN_PASSWORD || "",
             totpSecret: process.env.CHATGPT_TOTP_SECRET || "",
           });
-          await setupChatgptTotp(client, {
+          setupResult = await setupChatgptTotp(client, {
             chatgptBase,
             email,
             rl,
             deviceId: web.deviceId,
             resultPath,
+            logoutAllDevicesAfterTotp: Boolean(args.logoutAllDevicesAfterTotp),
+            resetTotp: Boolean(args.resetTotp),
+            checkpointPath,
           });
         }
         console.log(
@@ -481,7 +505,7 @@ async function run() {
             ? "[ok] ChatGPT web session cookie received"
             : "[warn] ChatGPT session cookie not found; continue with auth cookies",
         );
-        if (checkpointPath) {
+        if (checkpointPath && !setupResult?.logout_all_devices_attempted_at && !setupResult?.reset_totp_attempted_at) {
           const saveCheckpoint = createCheckpointWriter(checkpointPath, {
             client,
             email,
@@ -822,7 +846,233 @@ function isNewPasswordPage(value) {
   }
 }
 
-async function setupChatgptTotp(client, { chatgptBase, email, rl, deviceId, resultPath }) {
+async function assertTotpOperationNotPreviouslyAttempted(resultPath) {
+  let previous;
+  try { previous = JSON.parse(await fs.readFile(resultPath, "utf8")); } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw new Error("TOTP_RECOVERY_REQUIRED: Previous private operation state is unreadable; automatic continuation is blocked.");
+  }
+  if (previous?.reset_totp_attempted_at || previous?.logout_all_devices_attempted_at) {
+    throw new Error("TOTP_RECOVERY_REQUIRED: A previous account-security mutation was recorded; automatic continuation is blocked.");
+  }
+}
+
+function chatgptAccountApiHeaders(client, { chatgptBase, accessToken, deviceId, accountId }) {
+  const identity = browserIdentityForTransport(client.transport);
+  return {
+    authorization: `Bearer ${accessToken}`,
+    accept: "*/*",
+    "user-agent": identity.userAgent,
+    "accept-language": identity.acceptLanguage,
+    "sec-ch-ua": identity.secChUa,
+    "sec-ch-ua-mobile": identity.secChUaMobile,
+    "sec-ch-ua-platform": identity.secChUaPlatform,
+    "sec-fetch-site": "same-origin",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-dest": "empty",
+    priority: "u=1, i",
+    "oai-did": client.jar.value("oai-did", `${chatgptBase}/`) || deviceId,
+    "oai-language": identity.locale,
+    originator: "web",
+    ...(accountId ? { "chatgpt-account-id": accountId } : {}),
+  };
+}
+
+function resetStepError(message, uncertain = false) {
+  const error = new Error(message);
+  error.uncertain = uncertain;
+  return error;
+}
+
+async function readCurrentChatgptAccountId(client, { chatgptBase, accessToken }) {
+  let fromSession = null;
+  let fromToken = null;
+  try {
+    const session = await client.request("GET", `${chatgptBase}/api/auth/session`, {
+      referer: `${chatgptBase}/`, singleAttempt: true,
+    });
+    if (session.res.ok) {
+      const current = JSON.parse(session.text);
+      const value = current?.account?.id || current?.account?.account_id || current?.account_id;
+      if (typeof value === "string" && value.trim()) fromSession = value.trim();
+    }
+  } catch {}
+  try {
+    const claims = decodeJwtPayload(accessToken);
+    const value = claims?.["https://api.openai.com/auth"]?.chatgpt_account_id;
+    if (typeof value === "string" && value.trim()) fromToken = value.trim();
+  } catch {}
+  if (fromSession && fromToken && fromSession !== fromToken) {
+    throw resetStepError("Current web account context is inconsistent; no factor was removed.");
+  }
+  if (!fromSession && !fromToken) {
+    throw resetStepError("Current authenticated web account ID is unavailable; no factor was removed.");
+  }
+  return fromSession || fromToken;
+}
+
+async function totpResetRequest(client, context, method, endpoint, json) {
+  let response;
+  try {
+    response = await client.request(method, `${context.chatgptBase}${endpoint}`, {
+      headers: chatgptAccountApiHeaders(client, context),
+      referer: `${context.chatgptBase}/`,
+      ...(method === "POST" ? { origin: context.chatgptBase, json } : {}),
+      singleAttempt: true,
+      defaultHeaders: false,
+      omitHeaders: ["sec-fetch-user", "upgrade-insecure-requests"],
+      timeoutMs: testOnlyTimeout("TOSUB2_TEST_TOTP_RESET_TIMEOUT_MS", DEFAULT_TIMEOUT_MS),
+    });
+  } catch {
+    throw resetStepError("Account-security request did not return a confirmed response; it will not be retried.", true);
+  }
+  if (response.res.status < 200 || response.res.status >= 300) {
+    throw resetStepError(`Account-security request returned HTTP ${response.res.status}; it will not be retried.`, response.res.status >= 500);
+  }
+  try { return JSON.parse(response.text); } catch {
+    throw resetStepError("Account-security response could not be verified; it will not be retried.", true);
+  }
+}
+
+function ordinaryTotpFactors(info) {
+  if (!Array.isArray(info?.factors?.totp)) return null;
+  return info.factors.totp.filter((factor) => factor?.factor_type === "totp" && factor?.is_recovery === false
+    && typeof factor.id === "string" && factor.id.trim());
+}
+
+async function resetChatgptTotp(client, {
+  chatgptBase, email, deviceId, resultPath, checkpointPath, logoutAllDevicesAfterTotp,
+}) {
+  const operationId = process.env.TOSUB2_TOTP_OPERATION_ID || "";
+  const result = {
+    version: 1, operation_id: operationId, email, already_enabled: false,
+    activation_mode: "automatic", activation_succeeded: false, activation_verified: false,
+    reset_totp_requested: true, reset_totp_status: "pending", reset_totp_error: null,
+    reset_totp_phase: "initial", reset_totp_attempted_at: null, old_factor_invalidated: false,
+    logout_all_devices_requested: Boolean(logoutAllDevicesAfterTotp),
+    logout_all_devices_status: logoutAllDevicesAfterTotp ? "skipped" : "not_requested",
+    logout_all_devices_error: logoutAllDevicesAfterTotp ? "New 2FA activation and persistence are not complete." : null,
+    logout_all_devices_attempted_at: null,
+  };
+  const save = () => writePrivateJson(resultPath, result, { durable: true });
+  try {
+    await save();
+    console.log("[2fa-reset] Read current account and TOTP factor before replacement.");
+    const enablePage = await client.follow(`${chatgptBase}/?action=enable&factor=totp`, { referer: `${chatgptBase}/` });
+    const accessToken = extractChatgptAccessToken(enablePage.last?.text || "");
+    if (!accessToken) throw resetStepError("Current ChatGPT web access token is unavailable; no factor was removed.");
+    const accountId = await readCurrentChatgptAccountId(client, { chatgptBase, accessToken });
+    const context = { chatgptBase, accessToken, deviceId, accountId };
+    const infoEndpoint = "/backend-api/accounts/mfa_info";
+    const currentInfo = await totpResetRequest(client, context, "GET", infoEndpoint);
+    const factors = ordinaryTotpFactors(currentInfo);
+    if (!hasEnabledTotp(currentInfo) || factors?.length !== 1 || currentInfo.factors.totp.length !== 1) {
+      throw resetStepError("Exactly one unambiguous active, non-recovery TOTP factor is required; no factor was removed.");
+    }
+    const oldFactorId = factors[0].id;
+    result.old_totp_factor_id = oldFactorId;
+    result.reset_totp_status = "disabling";
+    result.reset_totp_phase = "disable_intent";
+    result.reset_totp_attempted_at = new Date().toISOString();
+    result.old_factor_invalidated = true;
+    await save();
+    const stateSaved = await waitForTotpParentAcknowledgement(operationId, "totp-reset-state", "totp-reset-state-persisted");
+    if (!stateSaved.ok) throw resetStepError("Reset intent could not be persisted by the parent; no removal request was sent.");
+    if (checkpointPath) await removeProtocolCheckpoint(checkpointPath);
+
+    console.log("[2fa-reset] Replace the selected existing TOTP factor once.");
+    const disabled = await totpResetRequest(client, context, "POST",
+      "/backend-api/accounts/mfa/user/disable_in_house", { factor_id: oldFactorId });
+    if (disabled?.message !== "Factor disabled") {
+      throw resetStepError("Removal response did not confirm the selected factor; further mutations are blocked.", true);
+    }
+    const disabledInfo = await totpResetRequest(client, context, "GET", infoEndpoint);
+    if (!Array.isArray(disabledInfo?.factors?.totp) || disabledInfo.factors.totp.length !== 0) {
+      throw resetStepError("Removal could not be verified against the live TOTP list; further mutations are blocked.", true);
+    }
+    result.reset_totp_status = "disabled";
+    result.reset_totp_phase = "disabled_verified";
+    await save();
+
+    const enrollment = await totpResetRequest(client, context, "POST", "/backend-api/accounts/mfa/enroll",
+      { factor_type: "totp", source: "settings" });
+    const secret = normalizeEnrolledTotpSecret(enrollment?.secret);
+    const sessionId = typeof enrollment?.session_id === "string" ? enrollment.session_id : "";
+    const newFactorId = enrollment?.factor?.id;
+    if (!secret || !sessionId || typeof newFactorId !== "string" || !newFactorId.trim() || newFactorId === oldFactorId
+        || enrollment?.factor?.factor_type !== "totp" || enrollment?.factor?.is_recovery !== false) {
+      throw resetStepError("New enrollment did not contain a valid, distinct non-recovery TOTP factor; activation was blocked.", true);
+    }
+    Object.assign(result, { secret, otpauth_uri: buildTotpUri(email, secret),
+      new_totp_factor_id: newFactorId, reset_totp_phase: "enrolled" });
+    await save();
+    result.reset_totp_phase = "activation_intent";
+    await save();
+    const activation = await totpResetRequest(client, context, "POST",
+      "/backend-api/accounts/mfa/user/activate_enrollment", {
+        factor_type: "totp", session_id: sessionId, code: generateTotp(secret), source: "settings",
+      });
+    if (activation?.success !== true) throw resetStepError("New TOTP activation was not accepted; automatic retry is blocked.");
+    result.activation_succeeded = true;
+    result.activated_at = new Date().toISOString();
+    await save();
+    const activeInfo = await totpResetRequest(client, context, "GET", infoEndpoint);
+    const activeFactors = ordinaryTotpFactors(activeInfo);
+    if (!hasEnabledTotp(activeInfo) || activeFactors?.length !== 1 || activeFactors[0].id !== newFactorId
+        || activeInfo.factors.totp.some((factor) => factor?.id === oldFactorId)) {
+      throw resetStepError("Activation response succeeded but the new live TOTP factor was not verified; recovery is required.", true);
+    }
+    Object.assign(result, { activation_verified: true,
+      reset_totp_status: "activated", reset_totp_phase: "activated_verified",
+      logout_all_devices_status: logoutAllDevicesAfterTotp ? "pending" : "not_requested",
+      logout_all_devices_error: null });
+    await save();
+    const credentialSaved = await waitForTotpCredentialPersistence(operationId);
+    if (!credentialSaved.ok) {
+      throw resetStepError("New TOTP is active, but credential persistence was not confirmed; logout is blocked and recovery is required.", true);
+    }
+    result.reset_totp_phase = "credential_persisted";
+    result.credential_persisted = true;
+    await save();
+    console.log("[ok] 2FA reset activated, verified, and saved.");
+    if (logoutAllDevicesAfterTotp) return logoutAllDevicesAfterActivatedTotp(client, {
+      ...context, resultPath, checkpointPath, operationId, result, credentialPersisted: true,
+    });
+    return result;
+  } catch (error) {
+    result.reset_totp_status = error?.uncertain || result.activation_succeeded ? "unknown" : "failed";
+    result.reset_totp_error = error?.uncertain !== undefined
+      ? error.message : "Reset state could not be safely persisted or verified; automatic continuation is blocked.";
+    if (result.reset_totp_attempted_at) {
+      result.reset_totp_last_phase = result.reset_totp_phase;
+      result.reset_totp_phase = "recovery_required";
+      if (checkpointPath) await removeProtocolCheckpoint(checkpointPath).catch(() => {});
+    }
+    if (logoutAllDevicesAfterTotp) {
+      result.logout_all_devices_status = "skipped";
+      result.logout_all_devices_error = "Reset and new credential persistence did not complete; no logout request was sent.";
+    }
+    await save().catch(() => {});
+    const failure = new Error(`TOTP_RESET_RECOVERY_REQUIRED: ${result.reset_totp_error}`);
+    failure.preventTotpRetry = true;
+    throw failure;
+  }
+}
+
+async function setupChatgptTotp(client, {
+  chatgptBase, email, rl, deviceId, resultPath, checkpointPath, logoutAllDevicesAfterTotp = false, resetTotp = false,
+}) {
+  if (resetTotp) return resetChatgptTotp(client, {
+    chatgptBase, email, deviceId, resultPath, checkpointPath, logoutAllDevicesAfterTotp,
+  });
+  const operationId = process.env.TOSUB2_TOTP_OPERATION_ID || "";
+  const logoutFields = {
+    ...(logoutAllDevicesAfterTotp ? { operation_id: operationId } : {}),
+    logout_all_devices_requested: logoutAllDevicesAfterTotp,
+    logout_all_devices_status: logoutAllDevicesAfterTotp ? "skipped" : "not_requested",
+    logout_all_devices_error: logoutAllDevicesAfterTotp ? "New 2FA activation has not completed." : null,
+    logout_all_devices_attempted_at: null,
+  };
   console.log("[2/3] Check current 2FA status");
   const enablePage = await client.follow(`${chatgptBase}/?action=enable&factor=totp`, {
     referer: `${chatgptBase}/`,
@@ -838,9 +1088,11 @@ async function setupChatgptTotp(client, { chatgptBase, email, rl, deviceId, resu
     referer: `${chatgptBase}/`,
   });
   if (hasEnabledTotp(currentInfo)) {
-    await writePrivateJson(resultPath, { version: 1, already_enabled: true, email });
+    const result = { version: 1, already_enabled: true, email, ...logoutFields };
+    if (logoutAllDevicesAfterTotp) result.logout_all_devices_error = "2FA was already enabled; logout was not requested.";
+    await writePrivateJson(resultPath, result);
     console.log("[2fa-already-enabled] This account already has TOTP 2FA enabled.");
-    return;
+    return result;
   }
 
   const { data: enrollment } = await client.getJson(
@@ -850,7 +1102,7 @@ async function setupChatgptTotp(client, { chatgptBase, email, rl, deviceId, resu
       headers: chatgptMfaHeaders({ chatgptBase, accessToken, deviceId }, "/backend-api/accounts/mfa/enroll"),
       origin: chatgptBase,
       referer: `${chatgptBase}/`,
-      json: { factor_type: "totp" },
+      json: { factor_type: "totp", source: "settings" },
     },
   );
   const secret = normalizeEnrolledTotpSecret(enrollment?.secret);
@@ -867,12 +1119,14 @@ async function setupChatgptTotp(client, { chatgptBase, email, rl, deviceId, resu
     email,
     secret,
     otpauth_uri: otpauthUri,
+    ...logoutFields,
   });
   console.log("[2fa-setup-ready] 2FA key created; activating it automatically.");
 
   console.log("[3/3] Activate TOTP 2FA");
   let code = generateTotp(secret);
   let generatedFromSecret = true;
+  let activatedResult;
   console.log("[2fa] Generated a current 6-digit activation code from the new 2FA key.");
   for (;;) {
     try {
@@ -887,11 +1141,11 @@ async function setupChatgptTotp(client, { chatgptBase, email, rl, deviceId, resu
           }, "/backend-api/accounts/mfa/user/activate_enrollment"),
           origin: chatgptBase,
           referer: `${chatgptBase}/`,
-          json: { code, factor_type: "totp", session_id: sessionId },
+          json: { factor_type: "totp", session_id: sessionId, code, source: "settings" },
         },
       );
       if (activation?.success === true) {
-        await writePrivateJson(resultPath, {
+        activatedResult = {
           version: 1,
           already_enabled: false,
           activation_mode: "automatic",
@@ -900,7 +1154,11 @@ async function setupChatgptTotp(client, { chatgptBase, email, rl, deviceId, resu
           email,
           secret,
           otpauth_uri: otpauthUri,
-        });
+          ...logoutFields,
+          logout_all_devices_status: logoutAllDevicesAfterTotp ? "pending" : "not_requested",
+          logout_all_devices_error: null,
+        };
+        await writePrivateJson(resultPath, activatedResult, { durable: true });
         break;
       }
       console.log(
@@ -927,10 +1185,155 @@ async function setupChatgptTotp(client, { chatgptBase, email, rl, deviceId, resu
     if (!hasEnabledTotp(confirmedInfo)) {
       console.log("[warn] 2FA activation succeeded, but the follow-up status response did not confirm it.");
     }
-  } catch (error) {
-    console.log(`[warn] 2FA activation succeeded, but the follow-up status check failed: ${error.message}`);
+  } catch {
+    console.log("[warn] 2FA activation succeeded, but the follow-up status check failed.");
   }
   console.log("[ok] 2FA setup activated");
+  if (!logoutAllDevicesAfterTotp) return activatedResult;
+  return logoutAllDevicesAfterActivatedTotp(client, {
+    chatgptBase, accessToken, deviceId, resultPath, checkpointPath, operationId, result: activatedResult,
+  });
+}
+
+async function logoutAllDevicesAfterActivatedTotp(client, options) {
+  const { chatgptBase, accessToken, deviceId, resultPath, checkpointPath, operationId, result } = options;
+  const finish = async (status, error = null) => {
+    result.logout_all_devices_status = status;
+    result.logout_all_devices_error = error;
+    try {
+      await writePrivateJson(resultPath, result, { durable: true });
+    } catch {
+      // The previously flushed pending/unknown record remains authoritative on interruption.
+      console.log("[2fa-logout] Could not update the logout result; keep the saved 2FA credential.");
+    }
+    console.log(`[2fa-logout] ${status}${error ? `: ${error}` : ""}`);
+    return result;
+  };
+  try {
+    const persisted = options.credentialPersisted ? { ok: true } : await waitForTotpCredentialPersistence(operationId);
+    if (!persisted.ok) return finish("skipped", persisted.error);
+
+    // Account context is read from this authenticated web session, never from Codex OAuth.
+    let accountId = options.accountId || null;
+    try {
+      if (!accountId) {
+      const session = await client.request("GET", `${chatgptBase}/api/auth/session`, {
+        referer: `${chatgptBase}/`, singleAttempt: true,
+      });
+      if (session.res.ok) {
+        const current = JSON.parse(session.text);
+        const value = current?.account?.id || current?.account?.account_id || current?.account_id;
+        if (typeof value === "string" && value.trim()) accountId = value.trim();
+      }
+      }
+    } catch {}
+
+    const identity = browserIdentityForTransport(client.transport);
+    const headers = {
+      authorization: `Bearer ${accessToken}`,
+      accept: "*/*",
+      "content-length": "0",
+      "user-agent": identity.userAgent,
+      "accept-language": identity.acceptLanguage,
+      "sec-ch-ua": identity.secChUa,
+      "sec-ch-ua-mobile": identity.secChUaMobile,
+      "sec-ch-ua-platform": identity.secChUaPlatform,
+      "sec-fetch-site": "same-origin",
+      "sec-fetch-mode": "cors",
+      "sec-fetch-dest": "empty",
+      priority: "u=1, i",
+      "oai-did": client.jar.value("oai-did", `${chatgptBase}/`) || deviceId,
+      "oai-language": identity.locale,
+      originator: "web",
+      ...(accountId ? { "chatgpt-account-id": accountId } : {}),
+    };
+
+    // Mark uncertainty BEFORE dispatch. A crash must never authorize an automatic replay.
+    result.logout_all_devices_status = "unknown";
+    result.logout_all_devices_error = "Logout request outcome is not confirmed.";
+    result.logout_all_devices_attempted_at = new Date().toISOString();
+    try {
+      await writePrivateJson(resultPath, result, { durable: true });
+      if (checkpointPath) await removeProtocolCheckpoint(checkpointPath);
+    } catch {
+      return finish("skipped", "Could not safely persist logout intent or invalidate the saved session; no request was sent.");
+    }
+
+    const response = await client.request("POST", `${chatgptBase}/backend-api/accounts/logout_all`, {
+      headers,
+      origin: chatgptBase,
+      referer: `${chatgptBase}/`,
+      body: Buffer.alloc(0),
+      singleAttempt: true,
+      defaultHeaders: false,
+      omitHeaders: ["content-type", "sec-fetch-user", "upgrade-insecure-requests"],
+      timeoutMs: testOnlyTimeout("TOSUB2_TEST_LOGOUT_TIMEOUT_MS", DEFAULT_TIMEOUT_MS),
+    });
+    if (response.res.status >= 200 && response.res.status < 300) {
+      const body = response.text.trim();
+      let ambiguous = /text\/html/i.test(response.res.headers.get("content-type") || "")
+        || /^(?:<!doctype\s+html|<html|<script)/i.test(body) || isRiskControlResponse(response.res, body);
+      if (body.startsWith("{") || body.startsWith("[")) {
+        try {
+          const payload = JSON.parse(body);
+          ambiguous ||= Boolean(payload?.error) || payload?.success === false;
+        } catch { ambiguous = true; }
+      }
+      if (ambiguous) return finish("unknown", "Logout response did not confirm completion; it will not be retried.");
+      return finish("succeeded");
+    }
+    if (response.res.status >= 500) return finish("unknown", `Logout request returned HTTP ${response.res.status}; its outcome is unknown and it will not be retried.`);
+    return finish("failed", `Logout request returned HTTP ${response.res.status}; it will not be retried.`);
+  } catch {
+    // Do not propagate proxy/transport failures into login or enrollment retry logic.
+    return finish(result.logout_all_devices_attempted_at ? "unknown" : "skipped",
+      result.logout_all_devices_attempted_at
+        ? "Logout request outcome is unknown; it will not be retried."
+        : "Could not confirm safe credential persistence; no logout request was sent.");
+  }
+}
+
+function testOnlyTimeout(name, fallback) {
+  const value = Number(process.env[name]);
+  return process.env.NODE_ENV === "test" && value > 0 && value <= fallback ? value : fallback;
+}
+
+function waitForTotpCredentialPersistence(operationId) {
+  return waitForTotpParentAcknowledgement(operationId, "totp-credential-ready", "totp-credential-persisted");
+}
+
+function waitForTotpParentAcknowledgement(operationId, readyType, acknowledgementType) {
+  if (!operationId || typeof process.send !== "function" || !process.connected) {
+    return Promise.resolve({ ok: false, error: "Credential persistence acknowledgement is unavailable; logout was skipped." });
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      process.off("message", onMessage);
+      process.off("disconnect", onDisconnect);
+      resolve(value);
+    };
+    const onDisconnect = () => finish({ ok: false, error: "Credential persistence channel disconnected; logout was skipped." });
+    const onMessage = (message) => {
+      if (message?.type !== acknowledgementType || message.operationId !== operationId) return;
+      finish(message.ok === true
+        ? { ok: true }
+        : { ok: false, error: "Credential persistence was not confirmed; logout was skipped." });
+    };
+    process.on("message", onMessage);
+    process.once("disconnect", onDisconnect);
+    timer = setTimeout(() => finish({ ok: false, error: "Credential persistence acknowledgement timed out; logout was skipped." }),
+      testOnlyTimeout("TOSUB2_TEST_TOTP_ACK_TIMEOUT_MS", 15_000));
+    try {
+      process.send({ type: readyType, operationId }, (error) => {
+        if (error) onDisconnect();
+      });
+    } catch { onDisconnect(); }
+  });
 }
 
 function chatgptMfaHeaders({ chatgptBase, accessToken, deviceId }, targetPath) {
@@ -2147,8 +2550,8 @@ async function readProtocolCheckpoint(checkpointPath) {
   return data;
 }
 
-async function writePrivateJson(filePath, data) {
-  await writeJsonAtomic(filePath, data, { mode: 0o600 });
+async function writePrivateJson(filePath, data, options = {}) {
+  await writeJsonAtomic(filePath, data, { ...options, mode: 0o600 });
   await fs.chmod(filePath, 0o600);
 }
 
@@ -2162,6 +2565,10 @@ async function writeJsonAtomic(filePath, data, options = {}) {
       options.mode ? { mode: options.mode } : undefined,
     );
     JSON.parse(await fs.readFile(tempPath, "utf8"));
+    if (options.durable) {
+      const handle = await fs.open(tempPath, "r+");
+      try { await handle.sync(); } finally { await handle.close(); }
+    }
     await fs.rename(tempPath, filePath);
   } catch (error) {
     await fs.rm(tempPath, { force: true }).catch(() => {});
@@ -2220,6 +2627,8 @@ function parseArgs(argv) {
     else if (item === "--debug-auth") args.debugAuth = true;
     else if (item === "--web-only") args.webOnly = true;
     else if (item === "--setup-totp") args.setupTotp = true;
+    else if (item === "--reset-totp") args.resetTotp = true;
+    else if (item === "--logout-all-devices-after-totp") args.logoutAllDevicesAfterTotp = true;
     else if (item === "--add-password") args.addPassword = true;
     else if (item.startsWith("--password-add-result=")) args.passwordAddResult = item.slice("--password-add-result=".length);
     else if (item === "--password-add-result") args.passwordAddResult = argv[++i];
@@ -2362,6 +2771,8 @@ Options:
   --phone <phone>                 Phone number in E.164 format. If omitted, prompt when needed.
   --web-only                      Only complete ChatGPT web login, skip Codex OAuth.
   --setup-totp                    Sign in and set up TOTP 2FA; skip Codex OAuth.
+  --reset-totp                    Explicitly replace one existing TOTP factor; requires parent persistence IPC.
+  --logout-all-devices-after-totp  After NEW 2FA activation and parent persistence ACK, log out all devices once.
   --totp-result <file>            Private 2FA setup result. Default: ${DEFAULT_TOTP_RESULT}
   --add-password                  Sign in and add a password to a passwordless account.
   --password-add-result <file>    Private add-password result. Default: ${DEFAULT_PASSWORD_ADD_RESULT}
