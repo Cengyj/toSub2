@@ -64,6 +64,9 @@ const OUTPUT_ROOT = path.resolve(
 );
 const SUB2API_MONITOR_PATH = path.join(OUTPUT_ROOT, SUB2API_MONITOR_FILENAME);
 const credentialStore = createCredentialStore();
+// Unsupported platforms retain only credentials supplied during this server session.
+// Keep one current value per email so historical jobs cannot export stale secrets.
+const sessionLoginCredentials = new Map();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
 const customSmsPoolPositions = new Map();
@@ -752,6 +755,7 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
   beginAuthorizationAutomationAttempt(job, "initial");
   jobs.set(id, job);
   await saveJobMetadata(job);
+  rememberSessionLoginCredentials(email, { password, totpSecret });
   scheduleQueuedJobs();
   return job;
 }
@@ -1261,6 +1265,8 @@ async function finishPasswordAdd(job, code, signal) {
     job.loginMode = "password";
     job.passwordAddedAt = result.added_at || new Date().toISOString();
     const persisted = await saveStoredLoginCredentials(job.email, job);
+    // The remote password has changed; retain it even if later metadata I/O fails.
+    rememberSessionLoginCredentials(job.email, { password: result.password });
     job.passwordAddError = persisted
       ? null
       : "当前系统不支持持久凭据存储，新密码仅在本次服务运行期间可用";
@@ -2501,6 +2507,7 @@ async function submitJobInput(job, body, options = {}) {
     job.hasPasswordCredential = true;
     markAuthorizationManual(job, "password");
     await saveJobMetadata(job);
+    rememberSessionLoginCredentials(job.email, { password: rawValue });
     inputValue = rawValue;
     setStage(job, "working", "正在验证账号密码");
   } else if (action === "mfa_otp") {
@@ -3299,7 +3306,9 @@ async function readAccountSource(job) {
     const requiresTotp = related.some((entry) => entry.totpSecret || entry.hasTotpCredential);
     let loadedPayload = false;
     try {
-      const stored = await credentialStore.load(job.email);
+      const stored = supportsPersistentCredentialStorage()
+        ? await credentialStore.load(job.email)
+        : sessionLoginCredentials.get(email) || {};
       loadedPayload = true;
       if (!stored || typeof stored !== "object") throw new Error("unavailable");
       storedCredentials = {
@@ -3311,14 +3320,15 @@ async function readAccountSource(job) {
         throw httpError(409, "无法从系统安全凭据存储读取当前账号资料，请恢复凭据后重试");
       }
     }
-    // Read the current persisted key, never a cached pre-reset key from the UI.
+    // Use the platform's current credential authority, never historical job memory.
     assertAccountSourceAvailable(job);
     const { password, totpSecret } = storedCredentials;
+    const sourceLocation = supportsPersistentCredentialStorage() ? "系统安全凭据存储" : "当前服务器会话";
     if (requiresPassword && !password) {
-      throw httpError(409, `${job.email} 的密码未能从系统安全凭据存储读取，请重新导入该账号资料`);
+      throw httpError(409, `${job.email} 的密码未能从${sourceLocation}读取，请重新导入该账号资料`);
     }
     if (requiresTotp && !totpSecret) {
-      throw httpError(409, `${job.email} 的 2FA 密钥未能从系统安全凭据存储读取，请重新导入该账号资料`);
+      throw httpError(409, `${job.email} 的 2FA 密钥未能从${sourceLocation}读取，请重新导入该账号资料`);
     }
     const account = {
       email: job.email, password, totpSecret,
@@ -3334,9 +3344,10 @@ function accountSourceRevision(job) {
   const email = String(job.email || "").trim().toLowerCase();
   const related = [...jobs.values()].filter((entry) => !entry.deleted
     && String(entry.email || "").trim().toLowerCase() === email).sort((left, right) => left.id.localeCompare(right.id));
-  return JSON.stringify(related.map((entry) => [entry.id, entry.email, entry.password, entry.totpSecret, entry.mailApiUrl,
+  return JSON.stringify([related.map((entry) => [entry.id, entry.email, entry.password, entry.totpSecret, entry.mailApiUrl,
     entry.mailRequestBody, entry.loginMode, entry.hasPasswordCredential, entry.hasTotpCredential,
-    entry.passwordAddedAt, entry.totpSetupAttempt, entry.totpCredentialAckRunId, entry.totpResetAckRunId]));
+    entry.passwordAddedAt, entry.totpSetupAttempt, entry.totpCredentialAckRunId, entry.totpResetAckRunId]),
+  supportsPersistentCredentialStorage() ? null : sessionLoginCredentials.get(email) || null]);
 }
 
 function assertAccountSourceSnapshotCurrent(snapshot) {
@@ -3351,9 +3362,10 @@ function accountSourceVersion(job) {
   const related = [...jobs.values()].filter((entry) => !entry.deleted
     && String(entry.email || "").trim().toLowerCase() === email).sort((left, right) => left.id.localeCompare(right.id));
   // Public invalidation signal: no credential values or hashes of credential values.
-  return JSON.stringify(related.map((entry) => [entry.id, entry.status, entry.updatedAt || null,
+  return JSON.stringify([related.map((entry) => [entry.id, entry.status, entry.updatedAt || null,
     entry.runMode || null, entry.queuedMode || null, Boolean(entry.totpCredentialInvalidated),
-    Boolean(entry.totpRecoveryPending), entry.totpResetStatus || "not_requested"]));
+    Boolean(entry.totpRecoveryPending), entry.totpResetStatus || "not_requested"]),
+  supportsPersistentCredentialStorage() ? null : sessionLoginCredentials.get(email)?.revision || 0]);
 }
 
 async function exportSourceAccounts(res, ids) {
@@ -3730,6 +3742,7 @@ async function deleteJobsByEmail(email) {
     directories.add(path.dirname(job.outputPath));
     jobs.delete(job.id);
   });
+  sessionLoginCredentials.delete(String(email || "").trim().toLowerCase());
   await Promise.allSettled(matching.map((job) => job.metadataWritePromise).filter(Boolean));
   await Promise.all([
     ...[...directories].map((directory) => fs.rm(directory, { recursive: true, force: true })),
@@ -4817,7 +4830,10 @@ async function updateJobCredentials(job, credentials, options = {}) {
     job.totpResetError = null;
     job.totpSetupError = null;
   }
-  if (!changed) return;
+  if (!changed) {
+    if (!credentials.preserveExistingCredentials) rememberSessionLoginCredentials(job.email, normalized);
+    return;
+  }
   stopMailPolling(job);
   job.loginMode = normalized.loginMode;
   job.mailApiUrl = normalized.mailApiUrl;
@@ -4839,6 +4855,7 @@ async function updateJobCredentials(job, credentials, options = {}) {
     touch(job);
     await saveJobMetadata(job);
   }
+  if (!credentials.preserveExistingCredentials) rememberSessionLoginCredentials(job.email, normalized);
 }
 
 async function updateJobProxy(job, proxyUrl) {
@@ -4938,6 +4955,23 @@ async function saveJobMetadata(job) {
       await fs.rename(tempPath, metadataPath);
     });
   return job.metadataWritePromise;
+}
+
+function supportsPersistentCredentialStorage() {
+  return process.platform === "win32" || process.platform === "darwin";
+}
+
+function rememberSessionLoginCredentials(email, credentials) {
+  if (supportsPersistentCredentialStorage()) return;
+  const key = String(email || "").trim().toLowerCase();
+  const current = sessionLoginCredentials.get(key) || { password: "", totpSecret: "" };
+  // Only accepted live credential mutations call this; proxy/recovery saves do not.
+  const next = {
+    password: Object.hasOwn(credentials, "password") ? credentials.password : current.password,
+    totpSecret: Object.hasOwn(credentials, "totpSecret") ? credentials.totpSecret : current.totpSecret,
+  };
+  if (next.password === current.password && next.totpSecret === current.totpSecret) return;
+  sessionLoginCredentials.set(key, { ...next, revision: (current.revision || 0) + 1 });
 }
 
 async function saveStoredLoginCredentials(email, credentials = {}) {

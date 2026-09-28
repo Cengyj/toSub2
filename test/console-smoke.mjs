@@ -192,6 +192,15 @@ try {
   assert.equal(postMailBatch.jobs.find((job) => job.email === "post-unordered@example.com").loginMode, "password");
   postMailBatch.jobs.forEach((job) => assert.equal(job.autoEmailOtp, true));
 
+  const postPasswordJob = postMailBatch.jobs.find((job) => job.email === "post-password@example.com");
+  const postPasswordSourceResponse = await fetch(`${baseUrl}/api/jobs/${postPasswordJob.id}/source`, { headers });
+  const postPasswordSourceText = await postPasswordSourceResponse.text();
+  assert.equal(postPasswordSourceResponse.status, 200, postPasswordSourceText);
+  assert.deepEqual(JSON.parse(postPasswordSourceText).account, {
+    email: postPasswordJob.email, password: "test-password", totpSecret: "",
+    mailApiUrl: `${baseUrl}/api/bootstrap`, mailRequestBody: "opaque-account-body", loginMode: "password",
+  });
+
   const postMailSourceResponse = await fetch(`${baseUrl}/api/jobs/export-source`, {
     method: "POST",
     headers,

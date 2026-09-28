@@ -56,6 +56,20 @@ class RuntimeProcessTests(unittest.TestCase):
         _name, _process, line = runtime_process.runtime_output(process).events.get(timeout=timeout)
         return json.loads(line) if line is not None else None
 
+    def ready(self, process) -> None:
+        # Popen returning only means the OS created a process, not that Node
+        # loaded the fixture and installed its call handler. Wait outside the
+        # call deadline so EOF/framing tests measure those paths, not cold start.
+        try:
+            message = self.line(process)
+        except queue.Empty:
+            output = runtime_process.runtime_output(process)
+            self.fail(
+                f"Fixture readiness was not observed before starting the call: "
+                f"exit code {process.poll()}, stderr={output.stderr_tail!r}"
+            )
+        self.assertEqual(message, {"fixtureReady": True})
+
     def test_child_reads_closed_utf8_file_and_pipe(self):
         process = self.start("""
             const fs = require('node:fs');
@@ -126,16 +140,42 @@ class RuntimeProcessTests(unittest.TestCase):
                 fs.writeSync(2, Buffer.alloc(128 * 1024, 120));
                 process.stdout.write(JSON.stringify({type:'result', value:input.cookies.fixture}) + '\\n');
             });
+            process.stdout.write('{"fixtureReady":true}\\n');
         """)
         with mock.patch.object(sentinel_dynamic, "RUNTIME", fixture):
             process, input_file = sentinel_dynamic.start_runtime({}, "https://fixture.invalid/", {"fixture": "中文"}, node_command=NODE)
         self.runtimes.append((process, input_file))
+        self.ready(process)
         result = sentinel_dynamic.run_call(process, None, None, "https://fixture.invalid/", "token", "fixture", timeout_seconds=3)
         self.assertEqual(result["value"], "中文")
         self.assertEqual(result["networkResponses"], [])
 
     def test_sentinel_partial_stdout_times_out_and_cleans_process(self):
-        process = self.start("process.stdout.write('{'); setInterval(() => {}, 1000);")
+        process = self.start("""
+            const fs = require('node:fs');
+            const lines = require('node:readline').createInterface({input: process.stdin});
+            lines.once('line', () => {
+                fs.writeSync(1, '{');
+                fs.writeSync(2, 'fixture-partial-output-written');
+            });
+            process.stdout.write('{"fixtureReady":true}\\n');
+        """)
+        self.ready(process)
+        started = time.monotonic()
+        with self.assertRaisesRegex(TimeoutError, "Sentinel runtime call timed out"):
+            sentinel_dynamic.run_call(process, None, None, "https://fixture.invalid/", "token", "fixture", timeout_seconds=0.3)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertIsNotNone(process.poll())
+        self.assertIn("fixture-partial-output-written", runtime_process.runtime_output(process).stderr_tail)
+
+    def test_sentinel_unready_runtime_still_respects_call_deadline(self):
+        # Deliberately never install a call handler. This models initialization
+        # that has not finished and must still consume the production deadline.
+        process = self.start("""
+            process.stdin.resume();
+            process.stdout.write('{"booting":true}\\n');
+        """)
+        self.assertEqual(self.line(process), {"booting": True})
         started = time.monotonic()
         with self.assertRaisesRegex(TimeoutError, "Sentinel runtime call timed out"):
             sentinel_dynamic.run_call(process, None, None, "https://fixture.invalid/", "token", "fixture", timeout_seconds=0.3)
@@ -149,9 +189,13 @@ class RuntimeProcessTests(unittest.TestCase):
                 require('node:fs').writeSync(2, 'fixture-crash');
                 process.exit(7);
             });
+            process.stdout.write('{"fixtureReady":true}\\n');
         """)
+        self.ready(process)
+        started = time.monotonic()
         with self.assertRaisesRegex(RuntimeError, r"exit code 7.*fixture-crash"):
             sentinel_dynamic.run_call(process, None, None, "https://fixture.invalid/", "token", "fixture", timeout_seconds=3)
+        self.assertLess(time.monotonic() - started, 3)
 
     def solver_session(self):
         session = SimpleNamespace(cookies=SimpleNamespace(jar=[]), requests=[], gets=[])

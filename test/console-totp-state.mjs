@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
+import path from "node:path";
 import vm from "node:vm";
 
 // Exercise the actual server lifecycle with deterministic files and credential I/O.
@@ -17,7 +18,8 @@ const names = [
   "stopTotpChild", "cancelJob", "canSetupTotp", "totpSetupUnavailableReason",
   "canResetTotp", "totpResetUnavailableReason", "isActive", "isTerminalStatus",
   "sanitizeLog", "normalizeTotpSecret", "saveStoredLoginCredentials", "loadStoredLoginCredentials",
-  "updateJobCredentials", "getAutoRepairEligibility",
+  "updateJobCredentials", "updateJobProxy", "finishPasswordAdd", "deleteJobsByEmail", "getAutoRepairEligibility",
+  "supportsPersistentCredentialStorage", "rememberSessionLoginCredentials",
   "assertAccountSourceAvailable", "readAccountSource", "accountSourceRevision",
   "assertAccountSourceSnapshotCurrent", "accountSourceVersion", "exportSourceAccounts", "withEmailJobLock",
 ];
@@ -31,13 +33,14 @@ const oldKey = "JBSWY3DPEHPK3PXP";
 const newKey = "NB2W45DFOIZAQWER";
 const now = "2026-09-29T00:00:00.000Z";
 
-function harness() {
+function harness(platform = "win32") {
   const events = [];
   const files = new Map();
-  const controls = { saveFails: false, readMismatch: false, metadataFails: false, readHook: null };
+  const controls = { saveFails: false, readMismatch: false, metadataFails: false, removeFails: false, readHook: null };
   let stored = { password: "test-password", totpSecret: oldKey, proxyUrl: "" };
   const ctx = vm.createContext({
-    crypto, Buffer, setTimeout, clearTimeout, shuttingDown: false, jobs: new Map(), emailJobLocks: new Map(),
+    crypto, path, Buffer, setTimeout, clearTimeout, shuttingDown: false, jobs: new Map(), emailJobLocks: new Map(),
+    process: { platform }, sessionLoginCredentials: new Map(),
     fs: {
       async readFile(file) {
         if (!files.has(file)) throw Object.assign(new Error("missing"), { code: "ENOENT" });
@@ -45,10 +48,20 @@ function harness() {
       },
       async unlink(file) { events.push("delete:" + file); files.delete(file); },
       async rename(from, to) { files.set(to, files.get(from)); files.delete(from); },
+      async rm(file) { if (controls.removeFails) throw new Error("file cleanup failed"); files.delete(file); },
     },
     credentialStore: {
-      async save(_email, data) { events.push("store-save"); if (controls.saveFails) throw new Error("store unavailable"); stored = { ...data }; },
-      async load(email) { events.push("store-read"); await controls.readHook?.(email); return { ...stored, totpSecret: controls.readMismatch ? "" : stored.totpSecret }; },
+      async save(_email, data) {
+        events.push("store-save");
+        if (platform !== "win32" && platform !== "darwin") throw Object.assign(new Error("unsupported"), { status: 501 });
+        if (controls.saveFails) throw new Error("store unavailable");
+        stored = { ...data };
+      },
+      async load(email) {
+        events.push("store-read"); await controls.readHook?.(email);
+        if (platform !== "win32" && platform !== "darwin") return { password: "", totpSecret: "", proxyUrl: "" };
+        return { ...stored, totpSecret: controls.readMismatch ? "" : stored.totpSecret };
+      },
     },
     async saveJobMetadata(job) {
       events.push("metadata");
@@ -79,6 +92,7 @@ function harness() {
     status: "working", runMode: "totp_setup", runId: "current", totpOperationId: "current",
     child, totpResultPath: "result", checkpointPath: "checkpoint", resultSaved: false,
     totpSetupResumesAuthorization: true, proxyUrl: "", logs: "",
+    mailSeenCandidateKeys: new Set(), mailCandidateCounts: new Map(),
   };
   ctx.jobs.set(job.id, job);
   files.set("checkpoint", { version: 1 });
@@ -311,6 +325,119 @@ for (const failure of ["saveFails", "readMismatch", "metadataFails"]) {
   const current = await h.ctx.readAccountSource(h.job);
   assert.equal(current.account.password, "updated-sibling-password");
   assert.equal(current.account.totpSecret, newKey, "historical job must still read a same-email sibling's current key");
+}
+
+{
+  const h = harness("linux");
+  Object.assign(h.job, { status: "completed", runMode: null });
+  assert.equal(await h.ctx.saveStoredLoginCredentials(h.job.email, h.job), false);
+  await assert.rejects(h.ctx.readAccountSource(h.job), { status: 409 }, "a save/recovery attempt must not seed session credentials");
+  h.ctx.rememberSessionLoginCredentials(h.job.email, { password: h.job.password, totpSecret: oldKey });
+  const snapshot = await h.ctx.readAccountSource(h.job);
+  assert.equal(snapshot.account.password, h.job.password);
+  assert.equal(snapshot.account.totpSecret, oldKey);
+  let payload;
+  await h.ctx.exportSourceAccounts({ writeHead(status) { assert.equal(status, 200); }, end(value) { payload = String(value); } }, [h.job.id]);
+  assert.equal(payload.replace(/^\uFEFF/, "").trim(), `${h.job.email}----test-password----${oldKey}`);
+  assert.equal(h.events.includes("store-read"), false, "memory-only source must not require unavailable storage");
+
+  h.ctx.rememberSessionLoginCredentials(h.job.email.toUpperCase(), { password: "current-password", totpSecret: newKey });
+  assert.throws(() => h.ctx.assertAccountSourceSnapshotCurrent(snapshot), { status: 409 });
+  const sibling = { ...h.job, id: "stale-history", email: h.job.email.toUpperCase() };
+  h.ctx.jobs.set(sibling.id, sibling);
+  await h.ctx.updateJobProxy(sibling, "http://proxy.example:8080");
+  await h.ctx.updateJobCredentials(sibling, { preserveExistingCredentials: true });
+  let current = await h.ctx.readAccountSource(sibling);
+  assert.equal(current.account.password, "current-password", "proxy-only saves must not restore a stale sibling password");
+  assert.equal(current.account.totpSecret, newKey, "proxy-only saves must not restore a stale sibling key");
+  await assert.rejects(h.ctx.updateJobCredentials(sibling, { password: "uncommitted-password", totpSecret: oldKey }), { status: 409 });
+  current = await h.ctx.readAccountSource(h.job);
+  assert.equal(current.account.password, "current-password", "failed durable-key replacement must not change session authority");
+  assert.equal(current.account.totpSecret, newKey);
+  h.ctx.rememberSessionLoginCredentials(sibling.email, { password: "accepted-password" });
+  current = await h.ctx.readAccountSource(h.job);
+  assert.equal(current.account.password, "accepted-password");
+  assert.equal(current.account.totpSecret, newKey, "password-only commits must preserve the current same-email key");
+
+  for (const flag of ["totpCredentialInvalidated", "totpRecoveryPending"]) {
+    sibling[flag] = true;
+    await assert.rejects(h.ctx.readAccountSource(h.job), { status: 409 });
+    let wrote = false;
+    await assert.rejects(h.ctx.exportSourceAccounts({ writeHead() { wrote = true; }, end() { wrote = true; } }, [h.job.id]), { status: 409 });
+    assert.equal(wrote, false);
+    sibling[flag] = false;
+  }
+  sibling.runMode = "password_add";
+  await assert.rejects(h.ctx.readAccountSource(h.job), { status: 409 });
+  sibling.runMode = null;
+  h.ctx.sessionLoginCredentials.clear();
+  await assert.rejects(h.ctx.readAccountSource(h.job), { status: 409 }, "restored job memory cannot repopulate a lost server session");
+}
+
+for (const platform of ["win32", "darwin"]) {
+  const h = harness(platform);
+  Object.assign(h.job, { status: "completed", runMode: null });
+  h.ctx.sessionLoginCredentials.set(h.job.email, { password: "cached-password", totpSecret: oldKey });
+  h.controls.readHook = async () => { throw new Error("store unavailable"); };
+  await assert.rejects(h.ctx.readAccountSource(h.job), { status: 409 }, `${platform} read errors must not fall back to memory`);
+  h.controls.readHook = null;
+  await h.ctx.credentialStore.save(h.job.email, { password: "", totpSecret: "" });
+  await assert.rejects(h.ctx.readAccountSource(h.job), { status: 409 }, `${platform} empty reads must not fall back to memory`);
+}
+
+{
+  const h = harness("linux");
+  Object.assign(h.job, { status: "completed", runMode: null, totpSecret: "", hasTotpCredential: false });
+  h.ctx.rememberSessionLoginCredentials(h.job.email, { password: h.job.password, totpSecret: "" });
+  await h.ctx.updateJobCredentials(h.job, { password: "accepted-account-edit", totpSecret: "" });
+  assert.equal((await h.ctx.readAccountSource(h.job)).account.password, "accepted-account-edit");
+  h.ctx.rememberSessionLoginCredentials(h.job.email, { password: "latest-sibling-password" });
+  const previousVersion = h.ctx.accountSourceVersion(h.job);
+  await h.ctx.updateJobCredentials(h.job, { password: "accepted-account-edit", totpSecret: "" });
+  assert.equal((await h.ctx.readAccountSource(h.job)).account.password, "accepted-account-edit");
+  assert.notEqual(h.ctx.accountSourceVersion(h.job), previousVersion, "an unchanged historical job can still change current session credentials and must invalidate open views");
+  assert.equal(h.ctx.accountSourceVersion(h.job).includes("accepted-account-edit"), false);
+  h.controls.metadataFails = true;
+  await assert.rejects(h.ctx.updateJobCredentials(h.job, { password: "failed-account-edit", totpSecret: "" }), /metadata write failed/);
+  assert.equal((await h.ctx.readAccountSource(h.job)).account.password, "accepted-account-edit", "failed local edits must retain the last accepted session credentials");
+}
+
+{
+  const h = harness("linux");
+  h.ctx.rememberSessionLoginCredentials(h.job.email, { password: "old-sibling-password", totpSecret: newKey });
+  Object.assign(h.job, { runMode: "password_add", passwordAddResultPath: "password-result", pendingNewPassword: "verified-new-password" });
+  h.files.set("password-result", { version: 1, email: h.job.email, password: h.job.pendingNewPassword });
+  h.controls.metadataFails = true;
+  await assert.rejects(h.ctx.finishPasswordAdd(h.job, 0, null), /metadata write failed/);
+  const current = await h.ctx.readAccountSource(h.job);
+  assert.equal(current.account.password, "verified-new-password", "a verified remote password change must never expose the old password after metadata failure");
+  assert.equal(current.account.totpSecret, newKey);
+}
+
+{
+  const h = harness("linux");
+  Object.assign(h.job, { status: "completed", runMode: null, outputPath: "output/result.json" });
+  h.child.kill = () => {};
+  h.ctx.rememberSessionLoginCredentials(h.job.email, { password: h.job.password, totpSecret: oldKey });
+  h.controls.removeFails = true;
+  await assert.rejects(h.ctx.deleteJobsByEmail(h.job.email), /file cleanup failed/);
+  assert.equal(h.ctx.sessionLoginCredentials.has(h.job.email), false, "logical deletion must clear memory even when disk cleanup fails");
+  h.job.deleted = false;
+  h.ctx.jobs.set(h.job.id, h.job);
+  await assert.rejects(h.ctx.readAccountSource(h.job), { status: 409 });
+}
+
+{
+  const h = harness("linux");
+  h.ctx.rememberSessionLoginCredentials(h.job.email, { password: h.job.password, totpSecret: oldKey });
+  h.files.set("result", resetResult());
+  await h.ctx.acknowledgeTotpResetState(h.job, h.child, "current");
+  assert.equal(h.events.at(-1).ack.ok, false, "session credentials must never acknowledge durable reset readiness");
+  assert.equal(h.files.has("result"), true);
+  h.files.set("result", activatedResult());
+  const recovery = await h.ctx.recoverActivatedTotpCredential({ email: h.job.email, resultPath: "result", credentials: h.job });
+  assert.equal(recovery.recovered, false);
+  assert.equal(h.ctx.sessionLoginCredentials.get(h.job.email).totpSecret, oldKey);
 }
 
 console.log("Console TOTP lifecycle and credential-view/export safety tests passed.");
