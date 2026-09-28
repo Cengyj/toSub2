@@ -207,6 +207,7 @@ async function handleApi(req, res, requestUrl) {
         phoneContext: true,
         batchDownload: true,
         bulkActions: true,
+        batchImportOnly: true,
         pagination: true,
         uniqueEmail: true,
         smsProviders: publicSmsProviderDefinitions(),
@@ -286,14 +287,8 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     const entries = parseBatchEntries(body.text, mailRequestConfig);
     const proxyUrl = normalizeProxyUrl(body.proxyUrl);
-    const results = await Promise.all(entries.map((entry) => withEmailJobLock(entry.email, async () => {
-      const existing = findJobByEmail(entry.email);
-      if (existing) {
-        await updateJobCredentials(existing, entry, { proxyUrl, hasProxyUpdate: true });
-        return { job: existing, updated: true };
-      }
-      return { job: await startJob(entry.email, entry, proxyUrl), updated: false };
-    })));
+    const hasProxyUpdate = Object.hasOwn(body, "proxyUrl");
+    const results = await Promise.all(entries.map((entry) => importAccount(entry, proxyUrl, hasProxyUpdate)));
     sendJson(res, 201, {
       jobs: results.map((item) => publicJob(item.job)),
       created: results.filter((item) => !item.updated).length,
@@ -327,7 +322,7 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     const selected = resolveSelectedJobs(body.ids);
     const unsupported = selected.find(
-      (job) => !["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
+      (job) => !["imported", "completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     );
     if (unsupported) throw httpError(409, `${unsupported.email} 当前仍在进行中，不能重新授权`);
     await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
@@ -657,7 +652,19 @@ function normalizeEmailFilter(value) {
   return [...unique];
 }
 
-async function startJob(email, credentials = {}, proxyUrl = null) {
+async function importAccount(entry, proxyUrl = null, hasProxyUpdate = false) {
+  return withEmailJobLock(entry.email, async () => {
+    const existing = findJobByEmail(entry.email);
+    if (existing) {
+      await updateJobCredentials(existing, entry, { proxyUrl, hasProxyUpdate, importOnly: true });
+      return { job: existing, updated: true };
+    }
+    return { job: await startJob(entry.email, entry, proxyUrl, { importOnly: true }), updated: false };
+  });
+}
+
+async function startJob(email, credentials = {}, proxyUrl = null, options = {}) {
+  const importOnly = options.importOnly === true;
   const { loginMode, mailApiUrl, mailRequestBody, password, totpSecret } = normalizeLoginCredentials(credentials);
   await saveStoredLoginCredentials(email, { password, totpSecret, proxyUrl });
   const id = crypto.randomUUID();
@@ -672,12 +679,12 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
   const job = {
     id,
     email,
-    status: "queued",
-    prompt: "已加入任务队列",
+    status: importOnly ? "imported" : "queued",
+    prompt: importOnly ? "已导入，请选择要执行的功能" : "已加入任务队列",
     createdAt,
     updatedAt: createdAt,
     lastOperationAt: createdAt,
-    lastOperationType: "initial_authorization",
+    lastOperationType: importOnly ? "account_import" : "initial_authorization",
     completedAt: null,
     outputPath,
     checkpointPath,
@@ -694,6 +701,7 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     hasPasswordCredential: Boolean(password),
     hasTotpCredential: Boolean(totpSecret),
     proxyUrl,
+    hasProxyCredential: Boolean(proxyUrl),
     mailApiUrl,
     mailRequestBody,
     mailSeenCandidateKeys: new Set(),
@@ -706,12 +714,12 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     currentPhone: null,
     phoneError: null,
     restartRequired: false,
-    attempt: 1,
+    attempt: importOnly ? 0 : 1,
     runId: null,
     runMode: null,
-    queuedMode: "full",
-    queuedAt: new Date().toISOString(),
-    queuedStartPrompt: "正在建立登录会话",
+    queuedMode: importOnly ? null : "full",
+    queuedAt: importOnly ? null : createdAt,
+    queuedStartPrompt: importOnly ? null : "正在建立登录会话",
     directTlsFallbackAttempted: false,
     directTlsProfile: null,
     lastRiskControlError: null,
@@ -726,6 +734,7 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     passwordAddedAt: null,
     pendingNewPassword: null,
     passwordAddResumesAuthorization: false,
+    securityActionReturnStatus: null,
     loginCheckpointAvailable: false,
     totpKnownEnabled: false,
     totpSetupAttempt: 0,
@@ -752,11 +761,11 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     autoRepairOperation: null,
     ...newSmsState(),
   };
-  beginAuthorizationAutomationAttempt(job, "initial");
+  if (!importOnly) beginAuthorizationAutomationAttempt(job, "initial");
   jobs.set(id, job);
   await saveJobMetadata(job);
   rememberSessionLoginCredentials(email, { password, totpSecret });
-  scheduleQueuedJobs();
+  if (!importOnly) scheduleQueuedJobs();
   return job;
 }
 
@@ -1002,10 +1011,12 @@ function handleChildCloseFailure(job, mode, runId, error) {
 
 async function retryJob(job, options = {}) {
   if (job.totpCredentialInvalidated || job.totpRecoveryPending) throw httpError(409, "2FA 恢复未完成，请先核实并导入有效密钥");
-  if (!["failed", "canceled", "reauth_required", "resume_available"].includes(job.status)) {
+  if (!["imported", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status)) {
     throw httpError(409, "当前任务不需要重新授权");
   }
+  if (job.status === "imported") options = await prepareImportedAction(job, options);
   const retryingSecurityCheck = Boolean(job.securityCheckRequired);
+  const firstAuthorization = job.attempt === 0;
   if (Object.hasOwn(options, "proxyUrl")) {
     job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
     const persisted = await saveStoredLoginCredentials(job.email, job);
@@ -1018,7 +1029,7 @@ async function retryJob(job, options = {}) {
   job.runId = crypto.randomUUID();
   job.child?.kill("SIGTERM");
   job.child = null;
-  const startPrompt = retryingSecurityCheck && resumingCheckpoint
+  const startPrompt = firstAuthorization ? "正在建立登录会话" : retryingSecurityCheck && resumingCheckpoint
     ? "正在使用已有登录状态重试手机号绑定"
     : "正在重新建立登录会话";
   job.lastError = null;
@@ -1028,6 +1039,7 @@ async function retryJob(job, options = {}) {
   job.phoneError = null;
   job.securityCheckRequired = false;
   job.restartRequired = false;
+  job.securityActionReturnStatus = null;
   job.attempt += 1;
   resetProxyRiskState(job);
   job.mailCandidateCounts.clear();
@@ -1035,8 +1047,8 @@ async function retryJob(job, options = {}) {
   job.autoRepairOperation = null;
   job.autoRepairPendingAccountIds = [];
   job.autoRepairPendingBackend = null;
-  beginAuthorizationAutomationAttempt(job, "manual_retry");
-  recordJobOperation(job, resumingCheckpoint ? "resume" : "reauthorize");
+  beginAuthorizationAutomationAttempt(job, firstAuthorization ? "initial" : "manual_retry");
+  recordJobOperation(job, firstAuthorization ? "initial_authorization" : resumingCheckpoint ? "resume" : "reauthorize");
   appendJobLog(
     job,
     retryingSecurityCheck
@@ -1077,6 +1089,8 @@ async function forceReloginJob(job, options = {}, context = {}) {
   if (!canForceRelogin(job)) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
+  const firstAuthorization = job.attempt === 0;
+  if (job.status === "imported") options = await prepareImportedAction(job, options);
   await reloadMissingJobCredentials(job);
   if (!canForceRelogin(job)) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
@@ -1103,6 +1117,7 @@ async function forceReloginJob(job, options = {}, context = {}) {
   job.phoneError = null;
   job.securityCheckRequired = false;
   job.restartRequired = false;
+  job.securityActionReturnStatus = null;
   job.totpSetupSecret = null;
   job.totpSetupUri = null;
   job.totpSetupError = null;
@@ -1122,12 +1137,30 @@ async function forceReloginJob(job, options = {}, context = {}) {
     job.autoRepairPendingBackend = context.autoRepair.backend || null;
   }
   beginAuthorizationAutomationAttempt(job, context.autoRepair ? "sub2api_monitor" : "manual_relogin");
-  recordJobOperation(job, context.autoRepair ? "automatic_relogin" : "relogin");
+  recordJobOperation(job, firstAuthorization ? "initial_authorization" : context.autoRepair ? "automatic_relogin" : "relogin");
   appendJobLog(job, `\n[relogin] 第 ${job.attempt} 次授权：跳过刷新令牌并强制重新登录。\n`);
   if (job.hasTotpCredential && !job.totpSecret) {
     appendJobLog(job, "[mfa] 本地未能读取已记录的 2FA 密钥，遇到 2FA 时需要手动输入验证码。\n");
   }
   enqueueJob(job, "full", "正在强制重新登录并完成授权");
+}
+
+async function prepareImportedAction(job, options) {
+  const missingInMemory = (job.hasPasswordCredential && !job.password)
+    || (job.hasTotpCredential && !job.totpSecret) || (job.hasProxyCredential && !job.proxyUrl);
+  const stored = missingInMemory ? await loadStoredLoginCredentials(job.email) : {};
+  const password = job.password || stored.password || "";
+  const totpSecret = job.totpSecret || stored.totpSecret || "";
+  const proxyUrl = job.proxyUrl || stored.proxyUrl || null;
+  const explicitProxy = String(options.proxyUrl || "").trim();
+  const missing = [];
+  if (job.hasPasswordCredential && !password) missing.push("密码");
+  if (job.hasTotpCredential && !totpSecret) missing.push("2FA 密钥");
+  if (job.hasProxyCredential && !proxyUrl && !explicitProxy) missing.push("代理地址");
+  if (missing.length) throw httpError(409, `已记录的${missing.join("、")}无法恢复，请重新导入或填写后再开始任务`);
+  // Validate all required fields before mutating or writing any recovered storage.
+  job.password = password; job.totpSecret = totpSecret; job.proxyUrl = proxyUrl;
+  return proxyUrl && !explicitProxy ? { ...options, proxyUrl } : options;
 }
 
 async function reloadMissingJobCredentials(job) {
@@ -1160,7 +1193,9 @@ async function startTotpSetup(job, options = {}) {
   if (!resetTotp && job.totpKnownEnabled) {
     throw httpError(409, "该账号已经启用 2FA，但本地没有它的原始密钥，无法重复创建");
   }
-  const resumeAuthorization = !job.resultSaved;
+  if (job.status === "imported") options = await prepareImportedAction(job, options);
+  const importedAction = job.status === "imported";
+  const resumeAuthorization = !job.resultSaved && !importedAction;
   if (resumeAuthorization && !(await fileExists(job.checkpointPath))) {
     job.loginCheckpointAvailable = false;
     throw httpError(409, "邮箱登录检查点已丢失，请先重新登录");
@@ -1182,6 +1217,7 @@ async function startTotpSetup(job, options = {}) {
   job.totpSetupUri = null;
   job.totpSetupError = null;
   job.totpSetupAttempt = (job.totpSetupAttempt || 0) + 1;
+  job.securityActionReturnStatus = importedAction ? "imported" : null;
   job.totpSetupResumesAuthorization = resumeAuthorization;
   Object.assign(job, newLogoutAllDevicesState(logoutAllDevicesAfterTotp));
   Object.assign(job, newTotpResetState(resetTotp));
@@ -1189,15 +1225,18 @@ async function startTotpSetup(job, options = {}) {
   job.lastError = null;
   job.parserTail = "";
   recordJobOperation(job, resetTotp ? "reset_2fa" : "setup_2fa");
-  appendJobLog(job, `\n[2fa] 开始第 ${job.totpSetupAttempt} 次 2FA 设置，原授权文件保持不变。\n`);
+  appendJobLog(job, `\n[2fa] 开始第 ${job.totpSetupAttempt} 次 2FA 设置，${importedAction ? "完成后等待手动选择下一步" : "原授权文件保持不变"}。\n`);
   enqueueJob(job, "totp_setup", "正在重新验证账号并准备设置 2FA");
 }
 
 async function startPasswordAdd(job, options = {}) {
+  await assertNoPendingTotpRecovery(job);
   if (!canAddPassword(job)) {
-    throw httpError(409, "只能为已完成授权，或已保存邮箱登录检查点且尚未保存密码的账号添加密码");
+    throw httpError(409, "只能为已导入、已完成授权或有登录检查点且尚未保存密码的账号添加密码，恢复状态必须已确认");
   }
-  const resumeAuthorization = !job.resultSaved;
+  if (job.status === "imported") options = await prepareImportedAction(job, options);
+  const importedAction = job.status === "imported";
+  const resumeAuthorization = !job.resultSaved && !importedAction;
   if (resumeAuthorization && !(await fileExists(job.checkpointPath))) {
     job.loginCheckpointAvailable = false;
     throw httpError(409, "邮箱登录检查点已丢失，请先重新登录");
@@ -1216,6 +1255,7 @@ async function startPasswordAdd(job, options = {}) {
   job.phoneError = null;
   await removePrivateFile(job.passwordAddResultPath);
   job.pendingNewPassword = generateStrongPassword();
+  job.securityActionReturnStatus = importedAction ? "imported" : null;
   job.passwordAddResumesAuthorization = resumeAuthorization;
   job.passwordAddError = null;
   resetProxyRiskState(job);
@@ -1247,6 +1287,7 @@ function generateStrongPassword() {
 }
 
 async function finishPasswordAdd(job, code, signal) {
+  const importedAction = job.securityActionReturnStatus === "imported" && !job.resultSaved;
   let result = null;
   try {
     result = JSON.parse(await fs.readFile(job.passwordAddResultPath, "utf8"));
@@ -1282,14 +1323,17 @@ async function finishPasswordAdd(job, code, signal) {
   } else {
     job.prompt = job.passwordAddResumesAuthorization
       ? "本次添加密码未完成，原登录检查点仍可继续"
-      : "原授权文件仍可使用，本次添加密码未完成";
+      : importedAction ? "本次添加密码未完成，请重新选择要执行的功能" : "原授权文件仍可使用，本次添加密码未完成";
     job.passwordAddError ||= signal
       ? `添加密码进程被 ${signal} 终止`
       : `添加密码进程退出，代码 ${code ?? "未知"}`;
     await removePrivateFile(job.passwordAddResultPath);
   }
 
-  job.status = job.passwordAddResumesAuthorization ? "resume_available" : "completed";
+  job.status = job.passwordAddResumesAuthorization ? "resume_available" : importedAction ? "imported" : "completed";
+  if (importedAction) {
+    job.queuedMode = null; job.queuedAt = null; job.queuedStartPrompt = null; job.queueRunId = null;
+  }
   job.lastError = job.passwordAddResumesAuthorization
     ? "ChatGPT 登录状态已保留，点击继续流程即可重新开始 Codex 授权"
     : null;
@@ -1297,22 +1341,28 @@ async function finishPasswordAdd(job, code, signal) {
   job.runId = null;
   job.pendingNewPassword = null;
   job.passwordAddResumesAuthorization = false;
+  job.securityActionReturnStatus = null;
   touch(job);
   await saveJobMetadata(job);
 }
 
 function restorePasswordAddFailure(job, message) {
   const resumeAuthorization = Boolean(job.passwordAddResumesAuthorization);
-  job.status = resumeAuthorization ? "resume_available" : "completed";
+  const importedAction = job.securityActionReturnStatus === "imported" && !job.resultSaved;
+  job.status = resumeAuthorization ? "resume_available" : importedAction ? "imported" : "completed";
+  if (importedAction) {
+    job.queuedMode = null; job.queuedAt = null; job.queuedStartPrompt = null; job.queueRunId = null;
+  }
   job.prompt = resumeAuthorization
     ? "本次添加密码未完成，原登录检查点仍可继续"
-    : "原授权文件仍可使用，本次添加密码未完成";
+    : importedAction ? "本次添加密码未完成，请重新选择要执行的功能" : "原授权文件仍可使用，本次添加密码未完成";
   job.passwordAddError = message;
   job.lastError = resumeAuthorization ? "点击继续流程可恢复 Codex 授权" : null;
   job.runMode = null;
   job.runId = null;
   job.pendingNewPassword = null;
   job.passwordAddResumesAuthorization = false;
+  job.securityActionReturnStatus = null;
   job.child?.kill("SIGTERM");
   job.child = null;
   touch(job);
@@ -1597,6 +1647,7 @@ async function loadTotpSetupResult(job) {
 
 async function finishTotpSetup(job, code, signal) {
   const resumeAuthorization = Boolean(job.totpSetupResumesAuthorization);
+  const importedAction = job.securityActionReturnStatus === "imported" && !job.resultSaved;
   let result = null;
   try {
     result = await loadTotpSetupResult(job);
@@ -1634,7 +1685,9 @@ async function finishTotpSetup(job, code, signal) {
       ? "2FA 已激活并保存，但最终状态确认未完成"
       : resumeAuthorization
         ? "2FA 已设置并安全保存，可以继续未完成的 Codex 授权"
-        : "2FA 已设置并安全保存，可以继续下载或重新授权";
+        : importedAction
+          ? persisted ? "2FA 已设置并安全保存，请手动选择下一步功能" : "2FA 已激活但密钥未持久保存，请先处理恢复状态"
+          : "2FA 已设置并安全保存，可以继续下载或重新授权";
     job.totpSetupError = !persisted
       ? "密钥持久保存未确认，2FA 密钥已保留在私有结果文件中，请不要删除该任务目录"
       : activationSucceeded && code !== 0
@@ -1649,13 +1702,16 @@ async function finishTotpSetup(job, code, signal) {
   } else {
     job.prompt = resumeAuthorization
       ? "本次 2FA 设置未完成，原登录检查点仍可继续"
-      : "授权文件仍然可用，本次 2FA 设置未完成";
+      : importedAction ? "本次 2FA 设置未完成，请重新选择要执行的功能" : "授权文件仍然可用，本次 2FA 设置未完成";
     job.totpSetupError ||= signal
       ? `2FA 设置进程被 ${signal} 终止`
       : `2FA 设置进程退出，代码 ${code ?? "未知"}`;
   }
 
-  job.status = resumeAuthorization ? "resume_available" : "completed";
+  job.status = resumeAuthorization ? "resume_available" : importedAction ? "imported" : "completed";
+  if (importedAction) {
+    job.queuedMode = null; job.queuedAt = null; job.queuedStartPrompt = null; job.queueRunId = null;
+  }
   job.lastError = resumeAuthorization
     ? "ChatGPT 登录状态已保留，点击继续流程即可重新开始 Codex 授权"
     : null;
@@ -1664,6 +1720,7 @@ async function finishTotpSetup(job, code, signal) {
   job.totpSetupSecret = null;
   job.totpSetupUri = null;
   job.totpSetupResumesAuthorization = false;
+  job.securityActionReturnStatus = null;
   if (job.logoutAllDevicesAfterTotp && !job.logoutAllDevicesCheckpointInvalidated) {
     job.prompt += `；${totpLogoutResultText(job)}`;
   }
@@ -1702,14 +1759,19 @@ function restoreTotpSetupFailure(job, message) {
   applyTotpLogoutResult(job, null, true);
   applyTotpResetResult(job, null, true);
   const resumeAuthorization = Boolean(job.totpSetupResumesAuthorization);
-  job.status = resumeAuthorization ? "resume_available" : "completed";
+  const importedAction = job.securityActionReturnStatus === "imported" && !job.resultSaved;
+  job.status = resumeAuthorization ? "resume_available" : importedAction ? "imported" : "completed";
+  if (importedAction) {
+    job.queuedMode = null; job.queuedAt = null; job.queuedStartPrompt = null; job.queueRunId = null;
+  }
   job.prompt = resumeAuthorization
     ? "本次 2FA 设置未完成，原登录检查点仍可继续"
-    : "授权文件仍然可用，本次 2FA 设置未完成";
+    : importedAction ? "本次 2FA 设置未完成，请重新选择要执行的功能" : "授权文件仍然可用，本次 2FA 设置未完成";
   job.totpSetupError = message;
   job.totpSetupSecret = null;
   job.totpSetupUri = null;
   job.totpSetupResumesAuthorization = false;
+  job.securityActionReturnStatus = null;
   job.lastError = resumeAuthorization ? "点击继续流程可恢复 Codex 授权" : null;
   job.runMode = null;
   job.child?.kill("SIGTERM");
@@ -2611,7 +2673,7 @@ async function cancelJob(job) {
     if (!job.totpKnownEnabled) {
       job.prompt = job.resultSaved
         ? "授权文件仍然可用，2FA 设置已取消"
-        : "2FA 设置已取消，原登录检查点仍可继续";
+        : job.status === "imported" ? "2FA 设置已取消，请重新选择要执行的功能" : "2FA 设置已取消，原登录检查点仍可继续";
       job.totpSetupError = "用户取消了本次 2FA 设置";
       touch(job);
       await saveJobMetadata(job);
@@ -2626,7 +2688,7 @@ async function cancelJob(job) {
     job.child = null;
     await finishPasswordAdd(job, 1, "SIGTERM");
     if (job.passwordAddError) {
-      job.prompt = "原授权文件仍可使用，添加密码已取消";
+      job.prompt = job.status === "imported" ? "添加密码已取消，请重新选择要执行的功能" : "原授权文件仍可使用，添加密码已取消";
       job.passwordAddError = "用户取消了本次添加密码";
       touch(job);
       await saveJobMetadata(job);
@@ -3181,6 +3243,7 @@ function isAutoRepairCoolingDown(job) {
 }
 
 function getAutoRepairEligibility(job) {
+  if (job.status === "imported") return { eligible: false, reason: "账号仅已导入，尚未手动开始授权" };
   if (job.totpCredentialInvalidated || job.totpRecoveryPending) return { eligible: false, reason: "2FA 恢复状态需手动核实，已暂停自动使用密钥" };
   if (job.autoRepairBlocked) return { eligible: false, reason: "账号已确认封禁、删除或永久停用" };
   if (!job.lastAuthAutomated) return { eligible: false, reason: job.lastAuthAutomationReason || "上次授权不是全自动完成" };
@@ -3469,7 +3532,7 @@ function publicJob(job) {
     canSetupTotp: canSetupTotp(job),
     canAddPassword: canAddPassword(job),
     restartRequired: job.restartRequired,
-    proxyConfigured: Boolean(job.proxyUrl),
+    proxyConfigured: Boolean(job.proxyUrl || job.hasProxyCredential),
     autoRepairEligible: autoRepair.eligible,
     autoRepairEligibilityReason: autoRepair.reason,
     autoRepairBlocked: Boolean(job.autoRepairBlocked),
@@ -3501,12 +3564,12 @@ function publicSelectionJob(job) {
 
 function canForceRelogin(job) {
   return !job.totpCredentialInvalidated && !job.totpRecoveryPending
-    && ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
+    && ["imported", "completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
 }
 
 function canRetryJob(job) {
   return !job.totpCredentialInvalidated && !job.totpRecoveryPending
-    && ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
+    && ["imported", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
 }
 
 function canSetupTotp(job) {
@@ -3518,6 +3581,7 @@ function totpSetupUnavailableReason(job) {
   if (job.totpCredentialInvalidated) return "2FA 重置尚未完成，请先手动核实并恢复有效密钥";
   if (job.totpSecret || job.hasTotpCredential) return "已保存 2FA 密钥；设置按钮仅用于首次启用，更换密钥请使用重置 2FA";
   if (job.totpKnownEnabled) return "账号已启用 2FA；更换密钥请使用重置 2FA";
+  if (job.status === "imported") return "";
   if (job.status === "completed" && job.resultSaved) return "";
   if (job.loginCheckpointAvailable && !job.logoutAllDevicesCheckpointInvalidated
     && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required"].includes(job.status)) return "";
@@ -3533,6 +3597,7 @@ function totpResetUnavailableReason(job) {
   if (job.totpRecoveryPending) return "存在尚未安全处理的 2FA 恢复结果，请先恢复有效密钥";
   if (job.totpCredentialInvalidated) return "上次 2FA 重置状态未确认，请先手动核实并恢复有效密钥";
   if (!(job.totpSecret || job.hasTotpCredential || job.totpKnownEnabled)) return "尚未确认账号已启用 2FA，请使用首次设置";
+  if (job.status === "imported") return "";
   if (job.status === "completed" && job.resultSaved) return "";
   if (job.loginCheckpointAvailable && !job.logoutAllDevicesCheckpointInvalidated
     && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required"].includes(job.status)) return "";
@@ -3541,7 +3606,9 @@ function totpResetUnavailableReason(job) {
 }
 
 function canAddPassword(job) {
+  if (job.totpCredentialInvalidated || job.totpRecoveryPending) return false;
   if (job.password || job.hasPasswordCredential) return false;
+  if (job.status === "imported") return true;
   if (job.status === "completed" && job.resultSaved) return true;
   return Boolean(job.loginCheckpointAvailable)
     && ["phone", "phone_otp", "resume_available", "failed", "canceled", "reauth_required"].includes(job.status);
@@ -3675,7 +3742,7 @@ function getQueuePosition(job) {
 }
 
 function isTerminalStatus(status) {
-  return ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(status);
+  return ["imported", "completed", "failed", "canceled", "reauth_required", "resume_available"].includes(status);
 }
 
 function uniqueByJson(items) {
@@ -3837,7 +3904,7 @@ async function syncCompletedOutputs(force = false) {
           currentPhone: metadata.sms_number || metadata.luban_number || null,
           phoneError: null,
           restartRequired: false,
-          attempt: Math.max(1, Number(metadata.attempt || 1)),
+          attempt: restoredAttemptCount(metadata),
           runId: null,
           runMode: null,
           fallbackInProgress: false,
@@ -3879,14 +3946,14 @@ async function syncCompletedOutputs(force = false) {
         storedCredentials = totpRecovery.credentials;
         const restoredAt = stat.mtime.toISOString();
         const savedStatus = String(metadata.status || "");
-        const restoredStatus = passwordRecovery.recovered || totpRecovery.recovered
+        const restoredStatus = savedStatus === "imported" ? "imported" : passwordRecovery.recovered || totpRecovery.recovered
           ? "resume_available"
           : isTerminalStatus(savedStatus) ? savedStatus : "resume_available";
         jobs.set(entry.name, {
           id: entry.name,
           email,
           status: restoredStatus,
-          prompt: totpRecovery.recovered
+          prompt: restoredStatus === "imported" ? "已恢复账号资料，请选择要执行的功能" : totpRecovery.recovered
             ? "已恢复成功激活的 2FA 密钥，可以继续未完成的 Codex 授权"
             : passwordRecovery.recovered
               ? "已恢复成功添加的新密码，可以继续未完成的 Codex 授权"
@@ -3907,7 +3974,7 @@ async function syncCompletedOutputs(force = false) {
             : passwordRecovery.recovered
               ? "[restore] 已从中断的添加密码流程恢复并安全保存新密码。\n"
             : `[restore] 已恢复 ${checkpoint.stage || "unknown"} 阶段的登录检查点。\n`,
-          lastError: passwordRecovery.recovered || totpRecovery.recovered
+          lastError: restoredStatus === "imported" ? metadata.last_error || null : passwordRecovery.recovered || totpRecovery.recovered
             ? "ChatGPT 登录状态已保留，点击继续流程即可重新开始 Codex 授权"
             : metadata.last_error || (restoredStatus === "resume_available"
               ? "上次流程在生成授权文件前中断"
@@ -3931,7 +3998,7 @@ async function syncCompletedOutputs(force = false) {
           currentPhone: checkpoint.oauth?.phone || metadata.sms_number || metadata.luban_number || null,
           phoneError: null,
           restartRequired: false,
-          attempt: Math.max(1, Number(metadata.attempt || 1)),
+          attempt: restoredAttemptCount(metadata),
           runId: null,
           runMode: null,
           fallbackInProgress: false,
@@ -3965,7 +4032,8 @@ async function syncCompletedOutputs(force = false) {
         const storedCredentialsMissing = missingStoredCredentials.length > 0;
         const savedStatus = String(metadata.status || "");
         const restartable = ["queued", "starting"].includes(savedStatus)
-          && metadata.queued_mode !== "totp_setup" && !metadata.totp_credential_invalidated;
+          && [undefined, null, "full", "refresh"].includes(metadata.queued_mode)
+          && !metadata.totp_credential_invalidated;
         const interrupted = Boolean(savedStatus) && !isTerminalStatus(savedStatus) && !restartable;
         const restoredStatus = storedCredentialsMissing && restartable
           ? "reauth_required"
@@ -4027,12 +4095,12 @@ async function syncCompletedOutputs(force = false) {
           currentPhone: metadata.sms_number || null,
           phoneError: null,
           restartRequired: restoredStatus === "reauth_required",
-          attempt: Math.max(1, Number(metadata.attempt || 1)),
+          attempt: restoredAttemptCount(metadata),
           runId: null,
           runMode: null,
-          queuedMode: restoredStatus === "queued" && metadata.queued_mode === "refresh" ? "refresh" : "full",
+          queuedMode: restoredStatus !== "queued" ? null : metadata.queued_mode === "refresh" ? "refresh" : "full",
           queuedAt: restoredStatus === "queued" ? metadata.queued_at || restoredAt : null,
-          queuedStartPrompt: metadata.queued_mode === "refresh"
+          queuedStartPrompt: restoredStatus !== "queued" ? null : metadata.queued_mode === "refresh"
             ? "正在使用已有刷新令牌直接生成新授权"
             : "正在建立登录会话",
           fallbackInProgress: false,
@@ -4296,10 +4364,17 @@ function normalizeLoginCredentials(value = {}) {
   return { loginMode, mailApiUrl, mailRequestBody, password, totpSecret };
 }
 
+function restoredAttemptCount(metadata = {}) {
+  const attempt = Number(metadata.attempt);
+  return metadata.attempt != null && Number.isInteger(attempt) && attempt >= 0
+    ? attempt : metadata.status === "imported" ? 0 : 1;
+}
+
 function restoredCredentialFlags(metadata = {}, credentials = {}) {
   const hasExplicitPasswordFlag = Object.hasOwn(metadata, "has_password");
   const hasExplicitTotpFlag = Object.hasOwn(metadata, "has_totp_key");
   return {
+    hasProxyCredential: Boolean(credentials.proxyUrl || metadata.proxy_configured),
     hasPasswordCredential: Boolean(
       credentials.password
       || (hasExplicitPasswordFlag ? metadata.has_password : metadata.login_mode === "password" && metadata.has_stored_credentials),
@@ -4794,10 +4869,14 @@ function escapeRegExp(value) {
 }
 
 async function updateJobCredentials(job, credentials, options = {}) {
+  if (options.importOnly && !accountImportChanges(job, credentials, options)) return;
   if (job.runMode === "totp_setup" && (job.totpResetAckRunId || job.totpCredentialAckRunId)) {
     throw httpError(409, "2FA 安全操作正在执行，请先等待完成或取消，不能同时修改账号资料");
   }
-  if (credentials.preserveExistingCredentials) await reloadMissingJobCredentials(job);
+  const activeImport = options.importOnly && [...jobs.values()].some((related) => !related.deleted
+    && String(related.email || "").trim().toLowerCase() === String(job.email || "").trim().toLowerCase()
+    && isActive(related.status));
+  if (credentials.preserveExistingCredentials && !activeImport) await reloadMissingJobCredentials(job);
   const normalized = credentials.preserveExistingCredentials
     ? normalizeLoginCredentials({
         password: job.password,
@@ -4813,10 +4892,17 @@ async function updateJobCredentials(job, credentials, options = {}) {
     || job.password !== normalized.password
     || job.totpSecret !== normalized.totpSecret
     || job.proxyUrl !== nextProxyUrl;
+  if (activeImport) {
+    if (changed) throw httpError(409, `${job.email} 正在执行或排队，请等待任务结束后再导入修改资料`);
+    return;
+  }
   await saveStoredLoginCredentials(job.email, { ...normalized, proxyUrl: nextProxyUrl,
     totpCredentialInvalidated: job.totpCredentialInvalidated
       && (credentials.preserveExistingCredentials || !normalized.totpSecret) });
-  if (normalized.totpSecret && !credentials.preserveExistingCredentials) {
+  const memoryOnlyImport = options.importOnly && !supportsPersistentCredentialStorage()
+    && !job.totpCredentialInvalidated && !job.totpRecoveryPending && !job.resetTotp
+    && !await fileExists(job.totpResultPath);
+  if (normalized.totpSecret && !credentials.preserveExistingCredentials && !memoryOnlyImport) {
     if ((await loadStoredLoginCredentials(job.email)).totpSecret !== normalized.totpSecret) {
       throw httpError(409, "新密钥尚未可靠保存，已保留原恢复资料");
     }
@@ -4843,6 +4929,7 @@ async function updateJobCredentials(job, credentials, options = {}) {
   job.hasPasswordCredential = Boolean(normalized.password);
   job.hasTotpCredential = Boolean(normalized.totpSecret);
   job.proxyUrl = nextProxyUrl;
+  if (options.hasProxyUpdate) job.hasProxyCredential = Boolean(nextProxyUrl);
   job.mailSeenCandidateKeys.clear();
   job.mailCandidateCounts.clear();
   job.mailStatus = job.mailApiUrl ? "baseline" : "manual";
@@ -4858,9 +4945,24 @@ async function updateJobCredentials(job, credentials, options = {}) {
   if (!credentials.preserveExistingCredentials) rememberSessionLoginCredentials(job.email, normalized);
 }
 
+function accountImportChanges(job, credentials, options) {
+  if (options.hasProxyUpdate && job.proxyUrl !== normalizeProxyUrl(options.proxyUrl)) return true;
+  if (credentials.preserveExistingCredentials) return false;
+  const normalized = normalizeLoginCredentials(credentials);
+  if (["loginMode", "mailApiUrl", "mailRequestBody", "password", "totpSecret"].some((key) => job[key] !== normalized[key])) return true;
+  const email = String(job.email || "").trim().toLowerCase();
+  const relatedActive = [...jobs.values()].some((related) => !related.deleted
+    && String(related.email || "").trim().toLowerCase() === email && isActive(related.status));
+  if (relatedActive) return false;
+  if (supportsPersistentCredentialStorage()) return true;
+  const current = sessionLoginCredentials.get(email);
+  return !current || current.password !== normalized.password || current.totpSecret !== normalized.totpSecret;
+}
+
 async function updateJobProxy(job, proxyUrl) {
   if (job.proxyUrl === proxyUrl) return;
   job.proxyUrl = proxyUrl;
+  job.hasProxyCredential = Boolean(proxyUrl);
   await saveStoredLoginCredentials(job.email, job);
   recordJobOperation(job, "proxy_update");
   appendJobLog(job, "[proxy] 账号代理配置已更新。\n");
@@ -4907,7 +5009,7 @@ async function saveJobMetadata(job) {
         last_error: job.lastError || null,
         result_saved: Boolean(job.resultSaved),
         completed_at: job.completedAt || null,
-        attempt: Number(job.attempt || 1),
+        attempt: restoredAttemptCount(job),
         security_check_required: Boolean(job.securityCheckRequired),
         queued_mode: job.queuedMode || null,
         queued_at: job.queuedAt || null,
@@ -4929,7 +5031,7 @@ async function saveJobMetadata(job) {
         login_checkpoint_available: Boolean(job.loginCheckpointAvailable),
         proxy_risk_retry_count: Number(job.proxyRiskRetryCount || 0),
         proxy_connection_failure_count: Number(job.proxyConnectionFailureCount || 0),
-        proxy_configured: Boolean(job.proxyUrl),
+        proxy_configured: Boolean(job.proxyUrl || job.hasProxyCredential),
         sms_provider_id: job.smsProviderId || null,
         sms_provider_name: job.smsProviderName || null,
         sms_service_label: job.smsServiceLabel || null,

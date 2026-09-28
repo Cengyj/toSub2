@@ -19,6 +19,7 @@ const fixture = (revision = 1, email = existing.email) => ({ email, password: `f
 
 await testTotpDialogs();
 await testSetupAndBatch();
+await testImportThenChooseAction();
 await testSourceLifecycle();
 await testLateResponses();
 await testFailuresAndExports();
@@ -29,8 +30,8 @@ async function mount(initialJobs, featureOverrides = {}) {
   const { window } = dom;
   const document = window.document;
   const state = { jobs: structuredClone(initialJobs), accounts: Object.fromEntries(initialJobs.map((job) => [job.id, fixture(1, job.email)])) };
-  const calls = { poll: 0, actions: [], sources: [], exports: [], confirms: [], clipboard: [], downloads: [], faults: [] };
-  const handlers = { action: null, source: null, export: null, clipboardReject: false };
+  const calls = { poll: 0, actions: [], imports: [], authorizations: [], sources: [], exports: [], confirms: [], clipboard: [], downloads: [], faults: [] };
+  const handlers = { action: null, import: null, source: null, export: null, clipboardReject: false };
   const blobs = new Map();
   const timeout = window.setTimeout.bind(window);
   window.setTimeout = (fn, delay, ...args) => timeout(fn, delay === 900 ? 45 : delay, ...args);
@@ -48,6 +49,15 @@ async function mount(initialJobs, featureOverrides = {}) {
       totpSetup: true, totpReset: true, logoutAllDevicesAfterTotp: true, sourceExport: true, ...featureOverrides } });
     if (url.startsWith("/api/jobs?page=")) { calls.poll += 1; return Response.json({ jobs: state.jobs, selection: state.jobs, stats: { active: 0, queued: 0, completed: state.jobs.length } }); }
     if (url === "/api/mail-request-config") return Response.json({});
+    if (url === "/api/jobs/batch") {
+      const call = { url, options, body: JSON.parse(options.body) }; calls.imports.push(call);
+      assert.ok(handlers.import, "the test must explicitly provide an import fixture");
+      return handlers.import(call);
+    }
+    if (url.endsWith("/retry") || url === "/api/jobs/reauthorize-batch") {
+      const call = { url, options, body: JSON.parse(options.body) }; calls.authorizations.push(call);
+      return Response.json({ started: call.body.ids?.length || 1 });
+    }
     if (url.endsWith("/setup-2fa") || url === "/api/jobs/setup-2fa-batch") {
       const call = { url, options, body: JSON.parse(options.body) }; calls.actions.push(call);
       return handlers.action ? handlers.action(call) : Response.json({ started: 1, skipped: call.body.ids ? state.jobs.length - 1 : 0 });
@@ -141,6 +151,53 @@ async function testSetupAndBatch() {
     assert.equal(ui.toggle(), null, "unavailable optional feature is not rendered");
     ui.button("确认设置 2FA", ui.dialog()).click(); await until(() => ui.calls.actions.length === 1 && !ui.dialog());
     assert.equal(ui.calls.actions[0].body.logoutAllDevicesAfterTotp, false);
+  } finally { ui.close(); }
+}
+
+async function testImportThenChooseAction() {
+  const imported = { ...fresh, id: "ui-imported", email: "imported@example.test", status: "imported",
+    prompt: "已导入，请选择要执行的功能", lastOperationType: "account_import", attempt: 0,
+    canRetry: true, canForceRelogin: true, canDownload: false, canRegenerate: false };
+  const ui = await mount([existing]);
+  try {
+    await until(() => ui.button("批量添加"));
+    ui.handlers.import = (call) => {
+      assert.equal(call.body.text, imported.email);
+      assert.deepEqual(Object.keys(call.body), ["text"], "an empty global proxy must not erase an existing account proxy during import");
+      ui.state.jobs = [imported, existing];
+      return Response.json({ jobs: [imported], created: 1, updated: 0 }, { status: 201 });
+    };
+    ui.button("批量添加").click(); await until(() => ui.dialog());
+    assert.match(ui.dialog().textContent, /仅导入列表.*自行选择/);
+    assert.doesNotMatch(ui.dialog().textContent, /自动排队/);
+    const input = ui.document.querySelector("#batch-input");
+    Object.getOwnPropertyDescriptor(ui.window.HTMLTextAreaElement.prototype, "value").set.call(input, imported.email);
+    input.dispatchEvent(new ui.window.Event("input", { bubbles: true }));
+    await until(() => ui.button("导入 1 个账号", ui.dialog()));
+    ui.button("导入 1 个账号", ui.dialog()).click();
+    await until(() => !ui.dialog() && ui.row(imported.email));
+    assert.equal(ui.calls.imports.length, 1); token(ui.calls.imports[0]);
+    const count = ui.calls.poll; await until(() => ui.calls.poll >= count + 3);
+    assert.equal(ui.calls.authorizations.length, 0, "import and subsequent polling never authorize automatically");
+    assert.equal(ui.calls.actions.length, 0, "import never starts a security action");
+    const row = ui.row(imported.email);
+    assert.equal(row.querySelector(".status-badge").textContent, "待操作");
+    assert.match(row.textContent, /导入账号/);
+    assert.ok(ui.button("开始授权", row));
+    assert.equal(ui.button("重新登录并授权", row), undefined);
+    assert.equal(row.querySelector('[title="取消任务"]'), null);
+    assert.equal(ui.button("下载授权文件", row), undefined);
+    assert.equal(ui.button("设置 2FA", row).disabled, false);
+    ui.button("设置 2FA", row).click(); await until(() => ui.toggle());
+    ui.button("取消", ui.dialog()).click(); await until(() => !ui.dialog());
+    assert.equal(ui.calls.actions.length, 0);
+    ui.button("开始授权", row).click(); await until(() => ui.calls.authorizations.length === 1);
+    assert.equal(ui.calls.authorizations[0].url, `/api/jobs/${imported.id}/retry`); token(ui.calls.authorizations[0]);
+    row.querySelector('input[type="checkbox"]').click();
+    await until(() => ui.button("批量开始授权") && !ui.button("批量开始授权").disabled);
+    ui.button("批量开始授权").click(); await until(() => ui.calls.authorizations.length === 2);
+    assert.equal(ui.calls.authorizations[1].url, "/api/jobs/reauthorize-batch");
+    assert.deepEqual(ui.calls.authorizations[1].body.ids, [imported.id]); token(ui.calls.authorizations[1]);
   } finally { ui.close(); }
 }
 

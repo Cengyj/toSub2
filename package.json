@@ -4,7 +4,8 @@
   "description": "通过协议登录 ChatGPT、完成 Codex 授权并生成 sub2api 导入文件",
   "type": "module",
   "scripts": {
-    "postcheck": "npm run check:2fa",
+    "postcheck": "npm run check:2fa && npm run check:import",
+    "check:import": "node test/console-import-state.mjs",
     "dev": "node src/console-server.mjs",
     "start": "node src/console-server.mjs",
     "deploy:windows": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/install-windows-autostart.ps1",

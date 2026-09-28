@@ -217,6 +217,7 @@ function App() {
     && downloadableSelectedCount > 0;
   const canReauthorizeSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && selectedJobs.every((job) => job.canRegenerate || job.canRetry);
+  const hasImportedSelected = selectedJobs.some((job) => job.status === "imported");
   const forceReloginSelectedCount = selectedJobs.filter((job) => job.canForceRelogin).length;
   const canForceReloginSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && forceReloginSelectedCount > 0;
@@ -504,10 +505,14 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/jobs/batch", {
         method: "POST",
-        body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ text: batchText, ...(accountProxyUrl.trim() ? { proxyUrl: accountProxyUrl.trim() } : {}) }),
       });
+      setEmailFilter([]);
+      setFilterText("");
+      setSelectedJobIds(new Set());
       setPage(1);
       if (page === 1) setJobs((current) => mergeJobs(data.jobs, current).slice(0, 20));
+      setUploadNotice(`已导入 ${data.created} 个账号${data.updated ? `，更新 ${data.updated} 个账号资料` : ""}。账号已加入列表，请勾选后手动选择要执行的功能。`);
       setBatchText("");
       setBatchError("");
       setBatchOpen(false);
@@ -747,7 +752,7 @@ function App() {
             <h2>授权任务</h2>
             <p>{emailFilter.length
               ? `匹配 ${pagination.total} 条，共 ${pagination.totalAll ?? pagination.total} 条任务`
-              : (pagination.total ? `共 ${pagination.total} 条任务` : "添加邮箱后开始第一条任务")}</p>
+              : (pagination.total ? `共 ${pagination.total} 条任务` : "添加邮箱或批量导入账号")}</p>
           </div>
           <form className="add-form" onSubmit={createJob}>
             <div className="email-field">
@@ -935,7 +940,7 @@ function App() {
               )}
               <button type="button" className="regenerate-button bulk-button" onClick={reauthorizeSelected} disabled={!canReauthorizeSelected || Boolean(batchAction)}>
                 {batchAction === "reauthorize" ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
-                批量重新授权
+                {hasImportedSelected ? "批量开始授权" : "批量重新授权"}
               </button>
               {features.forceRelogin && (
                 <button type="button" className="relogin-button bulk-button" onClick={forceReloginSelected} disabled={!canForceReloginSelected || Boolean(batchAction)}>
@@ -995,7 +1000,7 @@ function App() {
                 <th>账号</th>
                 <th>状态</th>
                 <th>当前操作</th>
-                <th>开始时间</th>
+                <th>添加时间</th>
                 <th>最近操作时间</th>
                 <th className="actions-heading">操作</th>
               </tr>
@@ -1449,7 +1454,7 @@ function App() {
             <div className="dialog-header">
               <div>
                 <h2 id="batch-title">批量添加账号</h2>
-                <span>{countBatchLines(batchText)} 条，超出并发上限后自动排队</span>
+                <span>{countBatchLines(batchText)} 条，仅导入列表；稍后自行选择要执行的功能</span>
               </div>
               <button type="button" className="icon-button" onClick={() => setBatchOpen(false)} disabled={batchBusy} title="关闭">
                 <X size={18} />
@@ -1475,7 +1480,7 @@ function App() {
               <button type="button" className="cancel-button" onClick={() => setBatchOpen(false)} disabled={batchBusy}>取消</button>
               <button type="submit" className="primary-button" disabled={!batchText.trim() || batchBusy || countBatchLines(batchText) > 500}>
                 {batchBusy ? <LoaderCircle className="spin" size={17} /> : <ListPlus size={17} />}
-                创建 {countBatchLines(batchText) || ""} 条任务
+                导入 {countBatchLines(batchText)} 个账号
               </button>
             </div>
           </form>
@@ -1525,7 +1530,7 @@ function EmptyState({ filtered = false }) {
         <div className="empty-state">
           <div><Mail size={24} /></div>
           <h3>{filtered ? "没有匹配账号" : "暂无授权任务"}</h3>
-          <p>{filtered ? "当前筛选邮箱不在任务列表中。" : "在右上方输入邮箱地址开始登录。"}</p>
+          <p>{filtered ? "当前筛选邮箱不在任务列表中。" : "可单个添加并开始登录，或批量导入后自行选择功能。"}</p>
         </div>
       </td>
     </tr>
@@ -1791,7 +1796,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
   }
 
   const inputConfig = getInputConfig(job.status, job.currentPhone);
-  const terminal = ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
+  const terminal = ["imported", "completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
 
   return (
     <tr className={`job-row status-${job.status}`}>
@@ -1811,6 +1816,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           <LoginMethodBadge job={job} />
         </div>
         <div className="account-quick-actions">
+          {job.status === "imported" && job.canRetry && (
+            <button type="button" className="secondary-button" onClick={retry} disabled={submitting || accountActionsBusy} title="开始登录并生成授权文件">
+              {submitting ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}开始授权
+            </button>
+          )}
           {sourceExportAvailable && <>
             <button type="button" className="secondary-button" onClick={onViewSource} title="查看当前保存的邮箱、密码、2FA 密钥与收码信息"><Eye size={16} />查看资料</button>
             <button type="button" className="secondary-button" onClick={onExportSource} disabled={accountActionsBusy} title="下载当前保存的账号资料；2FA 设置或重置完成后包含新密钥"><FileText size={16} />导出账号资料</button>
@@ -1947,7 +1957,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
               重新授权
             </button>
           )}
-          {forceReloginAvailable && job.canForceRelogin && (
+          {forceReloginAvailable && job.canForceRelogin && job.status !== "imported" && (
             <button type="button" className="relogin-button" onClick={forceRelogin} disabled={submitting} title="跳过刷新令牌和旧检查点，完整重新登录后自动授权">
               {submitting ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
               重新登录并授权
@@ -1958,7 +1968,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
               {submitting ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={16} />}
             </button>
           )}
-          {job.canRetry && (
+          {job.canRetry && job.status !== "imported" && (
             <button type="button" className="retry-button" onClick={retry} disabled={submitting}>
               {submitting ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
               {job.securityCheckRequired ? "手动重试" : job.canResume ? "继续流程" : "重新授权"}
@@ -2010,6 +2020,7 @@ function JobLogs({ token, jobId }) {
 
 function StatusBadge({ status }) {
   const config = {
+    imported: ["待操作", <ListPlus size={14} />],
     queued: ["排队中", <LoaderCircle size={14} />],
     starting: ["启动中", <LoaderCircle className="spin" size={14} />],
     working: ["处理中", <LoaderCircle className="spin" size={14} />],
@@ -2191,6 +2202,7 @@ function formatDateTime(value) {
 
 function operationLabel(type) {
   return ({
+    account_import: "导入账号",
     initial_authorization: "首次授权",
     reauthorize: "重新授权",
     relogin: "重新登录并授权",

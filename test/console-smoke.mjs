@@ -190,6 +190,9 @@ try {
   assert.equal(postMailBatchResponse.status, 201, postMailBatchText);
   const postMailBatch = JSON.parse(postMailBatchText);
   assert.equal(postMailBatch.jobs.length, 3);
+  assert.equal(postMailBatch.created, 3);
+  assert.equal(postMailBatch.updated, 0);
+  await assertImportedJobs(headers, postMailBatch.jobs);
   assert.equal(postMailBatch.jobs.find((job) => job.email === "post-body@example.com").loginMode, "email_otp");
   assert.equal(postMailBatch.jobs.find((job) => job.email === "post-password@example.com").loginMode, "password");
   assert.equal(postMailBatch.jobs.find((job) => job.email === "post-unordered@example.com").loginMode, "password");
@@ -329,6 +332,7 @@ try {
   } else {
     assert.match(updatedSourceText, /2FA 恢复状态尚未确认/);
   }
+  const beforeReimport = await waitForJob(headers, jobId, (value) => value.status === "completed");
   const reimportUpdatedSourceResponse = await fetch(`${baseUrl}/api/jobs/batch`, {
     method: "POST",
     headers,
@@ -342,6 +346,7 @@ try {
     assert.equal(reimportUpdatedSource.created, 0);
     assert.equal(reimportUpdatedSource.updated, 1);
     assert.equal(reimportUpdatedSource.jobs[0].hasTotpKey, true);
+    await assertJobNotRestarted(headers, beforeReimport, reimportUpdatedSource.jobs[0]);
   } else {
     assert.match(reimportUpdatedSourceText, /新密钥尚未可靠保存/);
     recoveryJobIds.push(jobId, profileJob.id);
@@ -372,6 +377,8 @@ try {
     assert.equal(readyResponse.status, 201, readyText);
     const ready = JSON.parse(readyText);
     assert.equal(ready.created, 2);
+    await assertImportedJobs(headers, ready.jobs);
+    await startImportedJobs(headers, ready.jobs);
     jobId = ready.jobs[0].id;
     currentAccountEmail = ready.jobs[0].email;
     await waitForJob(headers, jobId, (value) => value.status === "completed");
@@ -777,6 +784,9 @@ try {
   assert.equal(batchResponse.status, 201, batchText);
   const batch = JSON.parse(batchText);
   assert.equal(batch.jobs.length, 13);
+  assert.equal(batch.created, 13);
+  assert.equal(batch.updated, 0);
+  await assertImportedJobs(headers, batch.jobs);
   batch.jobs
     .filter((item) => !["manual-totp@example.net", "reverse.api-order@example.xyz"].includes(item.email))
     .forEach((item) => assert.equal(item.loginMode, "password"));
@@ -804,6 +814,7 @@ try {
   assert.equal(batch.jobs.find((item) => item.email === "biers.ellipse.case@icloud.com").loginMode, "password");
   assert.equal(batch.jobs.find((item) => item.email === "dot-password@example.com").hasTotpKey, true);
   assert.equal(batch.jobs.find((item) => item.email === "dot-password@example.com").loginMode, "password");
+  await startImportedJobs(headers, batch.jobs);
   await Promise.all(batch.jobs.map((item) => waitForJob(headers, item.id, (value) => value.status === "completed")));
 
   const sourceResponse = await fetch(`${baseUrl}/api/jobs/export-source`, {
@@ -845,12 +856,20 @@ try {
     assert.equal(response.status, 400, `${text}: ${responseText}`);
   }
 
+  const preservedJobBeforeImport = await waitForJob(
+    headers, batch.jobs[1].id, (value) => value.status === "completed",
+  );
   const preserveCredentialsResponse = await fetch(`${baseUrl}/api/jobs/batch`, {
     method: "POST",
     headers,
     body: JSON.stringify({ text: "password-mail-totp@example.com" }),
   });
-  assert.equal(preserveCredentialsResponse.status, 201, await preserveCredentialsResponse.text());
+  const preserveCredentialsText = await preserveCredentialsResponse.text();
+  assert.equal(preserveCredentialsResponse.status, 201, preserveCredentialsText);
+  const preserveCredentials = JSON.parse(preserveCredentialsText);
+  assert.equal(preserveCredentials.created, 0);
+  assert.equal(preserveCredentials.updated, 1);
+  await assertJobNotRestarted(headers, preservedJobBeforeImport, preserveCredentials.jobs[0]);
   const preservedSourceResponse = await fetch(`${baseUrl}/api/jobs/export-source`, {
     method: "POST",
     headers,
@@ -861,6 +880,20 @@ try {
     (await preservedSourceResponse.text()).replace(/^\uFEFF/, ""),
     new RegExp(`password-mail-totp@example\\.com----test-password-2----.*----JBSWY3DPEHPK3PXP`),
   );
+  const changedCredentialsResponse = await fetch(`${baseUrl}/api/jobs/batch`, {
+    method: "POST", headers, body: JSON.stringify({
+      text: `password-mail-totp@example.com----updated-import-password----${mailApiUrl}----JBSWY3DPEHPK3PXP`,
+    }),
+  });
+  const changedCredentialsText = await changedCredentialsResponse.text();
+  assert.equal(changedCredentialsResponse.status, 201, changedCredentialsText);
+  const changedCredentials = JSON.parse(changedCredentialsText);
+  assert.equal(changedCredentials.created, 0);
+  assert.equal(changedCredentials.updated, 1);
+  await assertJobNotRestarted(headers, preservedJobBeforeImport, changedCredentials.jobs[0], { credentialsChanged: true });
+  const changedSourceResponse = await fetch(`${baseUrl}/api/jobs/${preservedJobBeforeImport.id}/source`, { headers });
+  assert.equal(changedSourceResponse.status, 200);
+  assert.equal((await changedSourceResponse.json()).account.password, "updated-import-password");
 
   const manualPhoneResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
@@ -1128,6 +1161,63 @@ try {
   await Promise.race([childExit, delay(2_000)]);
   await new Promise((resolve) => sub2api.close(resolve));
   await fs.rm(outputRoot, { recursive: true, force: true });
+}
+
+async function assertImportedJobs(headers, importedJobs) {
+  for (const job of importedJobs) {
+    assert.equal(job.status, "imported");
+    assert.equal(job.attempt, 0);
+    assert.equal(job.lastOperationType, "account_import");
+    assert.equal(job.canDownload, false);
+    assert.equal(job.canRetry, true);
+    assert.equal(job.canForceRelogin, true);
+    assert.equal(job.queuePosition, 0);
+  }
+  await delay(150);
+  const page = await fetch(`${baseUrl}/api/jobs`, { headers }).then((response) => response.json());
+  for (const imported of importedJobs) {
+    const current = page.jobs.find((job) => job.id === imported.id);
+    assert.equal(current?.status, "imported", "batch import must stay idle until a function is chosen");
+    assert.equal(current.attempt, 0);
+    assert.equal(current.canDownload, false);
+    await assert.rejects(fs.access(path.join(outputRoot, imported.id, "sub2api-import-oauth.json")));
+    await assert.rejects(fs.access(path.join(outputRoot, imported.id, "login-checkpoint.json")));
+  }
+}
+
+async function startImportedJobs(headers, importedJobs) {
+  const response = await fetch(`${baseUrl}/api/jobs/reauthorize-batch`, {
+    method: "POST", headers, body: JSON.stringify({ ids: importedJobs.map((job) => job.id) }),
+  });
+  const responseText = await response.text();
+  assert.equal(response.status, 200, responseText);
+  const started = JSON.parse(responseText);
+  assert.equal(started.started, importedJobs.length);
+  for (const job of started.jobs) {
+    assert.equal(job.attempt, 1, "the user's first authorization is the first attempt");
+    assert.equal(job.lastOperationType, "initial_authorization");
+  }
+}
+
+async function assertJobNotRestarted(headers, before, updated, { credentialsChanged = false } = {}) {
+  assert.equal(updated.id, before.id);
+  for (const key of ["status", "attempt", "completedAt", "canDownload"]) {
+    assert.equal(updated[key], before[key], `credential import must preserve ${key}`);
+  }
+  if (credentialsChanged) {
+    assert.equal(updated.lastOperationType, "account_update");
+    assert.ok(Date.parse(updated.lastOperationAt) >= Date.parse(before.lastOperationAt));
+  } else {
+    assert.equal(updated.lastOperationType, before.lastOperationType);
+    assert.equal(updated.lastOperationAt, before.lastOperationAt);
+  }
+  await delay(150);
+  const page = await fetch(`${baseUrl}/api/jobs`, { headers }).then((response) => response.json());
+  const current = page.jobs.find((job) => job.id === before.id);
+  assert.equal(current?.status, before.status, "updating imported data must not rerun an existing job");
+  assert.equal(current.attempt, before.attempt);
+  assert.equal(current.lastOperationType, updated.lastOperationType);
+  assert.equal(current.lastOperationAt, updated.lastOperationAt);
 }
 
 async function waitForJson(url) {

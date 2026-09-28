@@ -1,16 +1,24 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const persistentCredentialsSupported = ["win32", "darwin"].includes(process.platform);
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-restore-"));
 const outputRoot = path.join(tempRoot, "output");
+const protocolInvocationsPath = path.join(tempRoot, "protocol-invocations.jsonl");
+const trackedProtocolPath = path.join(tempRoot, "tracked-protocol.mjs");
+await fs.writeFile(trackedProtocolPath, [
+  'import fs from "node:fs/promises";',
+  "await fs.appendFile(" + JSON.stringify(protocolInvocationsPath) + ", JSON.stringify(process.argv.slice(2)) + String.fromCharCode(10));",
+  "await import(" + JSON.stringify(pathToFileURL(path.join(projectRoot, "test", "mock-protocol-login.mjs")).href) + ");",
+].join("\n"), "utf8");
 const restoredId = "11111111-1111-4111-8111-111111111111";
 const restoredDir = path.join(outputRoot, restoredId);
 const restoredEmail = "restore-failed@example.com";
@@ -134,31 +142,8 @@ const shutdownPreload = `data:text/javascript,${encodeURIComponent(`
     if (!process.emit("SIGTERM")) throw new Error("Shutdown handler is not installed");
   });
 `)}`;
-const child = spawn(process.execPath, [
-  ...(cooperativeShutdown ? ["--import", shutdownPreload] : []),
-  path.join(projectRoot, "src", "console-server.mjs"),
-  "--host", "127.0.0.1",
-  "--port", String(port),
-], {
-  cwd: projectRoot,
-  env: {
-    ...process.env,
-    ONBOARDING_OUTPUT_ROOT: outputRoot,
-    ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-protocol-login.mjs"),
-    LOCALAPPDATA: path.join(tempRoot, "local-app-data"),
-    TOSUB2_MAC_CREDENTIAL_ROOT: path.join(tempRoot, "credentials"),
-    TOSUB2_TLS_PROFILE: "chrome142",
-  },
-  stdio: cooperativeShutdown ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
-  windowsHide: true,
-});
-
 let logs = "";
-child.stdout.setEncoding("utf8");
-child.stderr.setEncoding("utf8");
-child.stdout.on("data", (chunk) => { logs += chunk; });
-child.stderr.on("data", (chunk) => { logs += chunk; });
-const childExit = new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
+let { child, childExit } = startConsole();
 
 try {
   const bootstrap = await waitForJson(`${baseUrl}/api/bootstrap`);
@@ -224,6 +209,43 @@ try {
     assert.deepEqual(JSON.parse(await fs.readFile(totpEvidencePath, "utf8")), totpEvidence, "rejected retry must preserve the recovery result");
   }
 
+  const originalImportedPassword = "PendingPassword_481!";
+  const importedPassword = "UpdatedPendingPassword_481!";
+  const missingPassword = "PendingPassword_482!";
+  const missingTotp = "JBSWY3DPEHPK3PXP";
+  const importResponse = await fetch(`${baseUrl}/api/jobs/batch`, {
+    method: "POST", headers, body: JSON.stringify({ text: [
+      "restore-imported-plain@example.com",
+      `restore-imported-password@example.com----${originalImportedPassword}`,
+      `restore-imported-missing@example.com----${missingPassword}----${missingTotp}`,
+    ].join("\n") }),
+  });
+  const importText = await importResponse.text();
+  assert.equal(importResponse.status, 201, importText);
+  const imported = JSON.parse(importText);
+  assert.equal(imported.created, 3);
+  assert.equal(imported.updated, 0);
+  assert.equal(imported.jobs.length, 3);
+  for (const job of imported.jobs) assertImportedState(job);
+  const updateImportResponse = await fetch(`${baseUrl}/api/jobs/batch`, {
+    method: "POST", headers, body: JSON.stringify({
+      text: `restore-imported-password@example.com----${importedPassword}`,
+    }),
+  });
+  const updateImportText = await updateImportResponse.text();
+  assert.equal(updateImportResponse.status, 201, updateImportText);
+  const updatedImport = JSON.parse(updateImportText);
+  assert.equal(updatedImport.created, 0);
+  assert.equal(updatedImport.updated, 1);
+  assert.equal(updatedImport.jobs[0].id, imported.jobs[1].id);
+  assertImportedState(updatedImport.jobs[0], "account_update");
+  assert.equal(updatedImport.jobs[0].completedAt, imported.jobs[1].completedAt);
+  assert.ok(Date.parse(updatedImport.jobs[0].lastOperationAt) >= Date.parse(imported.jobs[1].lastOperationAt));
+  imported.jobs[1] = updatedImport.jobs[0];
+  await delay(150);
+  await assertImportedJobsRemainIdle(headers, imported.jobs, [originalImportedPassword, importedPassword, missingPassword, missingTotp]);
+  assert.deepEqual(await readProtocolInvocations(), [], "import must not spawn a protocol process");
+
   const createResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
     headers,
@@ -263,6 +285,46 @@ try {
   const metadata = JSON.parse(await fs.readFile(path.join(outputRoot, created.job.id, "job-meta.json"), "utf8"));
   assert.equal(metadata.status, "canceled");
   assert.equal(metadata.prompt, "流程已取消");
+  const invocationsBeforeRestart = await readProtocolInvocations();
+  assert.equal(invocationsBeforeRestart.length, 1, "only explicitly creating a single job starts authorization");
+  assert.ok(invocationsBeforeRestart[0].includes("mfa-prompt@example.com"));
+
+  // Simulate loss of one imported account's encrypted credential file, using
+  // only this test's isolated store. Linux never had a persistent copy.
+  const missingCredentialId = crypto.createHash("sha256")
+    .update("restore-imported-missing@example.com").digest("hex");
+  const missingCredentialPath = process.platform === "win32"
+    ? path.join(tempRoot, "local-app-data", "toSub2", "credentials", `${missingCredentialId}.dpapi`)
+    : path.join(tempRoot, "credentials", `${missingCredentialId}.enc`);
+  if (persistentCredentialsSupported) await fs.access(missingCredentialPath);
+  await fs.rm(missingCredentialPath, { force: true });
+
+  ({ child, childExit } = startConsole());
+  const restartedBootstrap = await waitForJson(`${baseUrl}/api/bootstrap`);
+  const restartedHeaders = { "content-type": "application/json", "x-console-token": restartedBootstrap.token };
+  await delay(200);
+  await assertImportedJobsRemainIdle(restartedHeaders, imported.jobs, [importedPassword, missingPassword, missingTotp]);
+  assert.deepEqual(await readProtocolInvocations(), invocationsBeforeRestart,
+    "restarting with missing credentials must not start authorization for imported accounts");
+  const missingSource = await fetch(`${baseUrl}/api/jobs/${imported.jobs[2].id}/source`, { headers: restartedHeaders });
+  assert.equal(missingSource.status, 409, "the missing credential fixture must actually lack exportable credentials");
+  const missingSourceText = await missingSource.text();
+  for (const secret of [missingPassword, missingTotp]) assert.equal(missingSourceText.includes(secret), false);
+  if (persistentCredentialsSupported) {
+    const retainedSource = await fetch(`${baseUrl}/api/jobs/${imported.jobs[1].id}/source`, { headers: restartedHeaders });
+    assert.equal(retainedSource.status, 200, "another imported account retains its stored credentials");
+    assert.equal((await retainedSource.json()).account.password, importedPassword);
+  }
+  if (cooperativeShutdown) {
+    await new Promise((resolve, reject) => child.send("tosub2-test-shutdown", (error) => error ? reject(error) : resolve()));
+  } else {
+    child.kill("SIGTERM");
+  }
+  const restartedExit = await Promise.race([childExit, delay(10_000).then(() => null)]);
+  assert.ok(restartedExit, "restarted console did not shut down");
+  assert.equal(restartedExit.code, 0, logs);
+  assert.equal(restartedExit.signal, null, logs);
+  assert.deepEqual(await readProtocolInvocations(), invocationsBeforeRestart);
   console.log("console restore and graceful shutdown tests passed");
 } finally {
   if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
@@ -270,6 +332,74 @@ try {
   sub2api.closeAllConnections?.();
   await new Promise((resolve) => sub2api.close(resolve));
   await fs.rm(tempRoot, { recursive: true, force: true });
+}
+
+function startConsole() {
+  const processHandle = spawn(process.execPath, [
+    ...(cooperativeShutdown ? ["--import", shutdownPreload] : []),
+    path.join(projectRoot, "src", "console-server.mjs"),
+    "--host", "127.0.0.1", "--port", String(port),
+  ], {
+    cwd: projectRoot,
+    env: {
+      ...process.env,
+      ONBOARDING_OUTPUT_ROOT: outputRoot,
+      ONBOARDING_PROTOCOL_SCRIPT: trackedProtocolPath,
+      LOCALAPPDATA: path.join(tempRoot, "local-app-data"),
+      TOSUB2_MAC_CREDENTIAL_ROOT: path.join(tempRoot, "credentials"),
+      TOSUB2_TLS_PROFILE: "chrome142",
+    },
+    stdio: cooperativeShutdown ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  processHandle.stdout.setEncoding("utf8");
+  processHandle.stderr.setEncoding("utf8");
+  processHandle.stdout.on("data", (chunk) => { logs += chunk; });
+  processHandle.stderr.on("data", (chunk) => { logs += chunk; });
+  return {
+    child: processHandle,
+    childExit: new Promise((resolve) => processHandle.once("exit", (code, signal) => resolve({ code, signal }))),
+  };
+}
+
+function assertImportedState(job, operationType = "account_import") {
+  assert.equal(job?.status, "imported");
+  assert.equal(job.attempt, 0);
+  assert.equal(job.lastOperationType, operationType);
+  assert.equal(job.canDownload, false);
+  assert.equal(job.queuePosition, 0);
+}
+
+async function assertImportedJobsRemainIdle(headers, importedJobs, secrets) {
+  const response = await fetch(`${baseUrl}/api/jobs`, { headers });
+  assert.equal(response.status, 200);
+  const page = await response.json();
+  for (const imported of importedJobs) {
+    const current = page.jobs.find((job) => job.id === imported.id);
+    assertImportedState(current, imported.lastOperationType);
+    assert.equal(current.lastOperationAt, imported.lastOperationAt);
+    const jobDir = path.join(outputRoot, imported.id);
+    assert.deepEqual(await fs.readdir(jobDir), ["job-meta.json"], "idle imports must not create authorization or checkpoint files");
+    const metadataText = await fs.readFile(path.join(jobDir, "job-meta.json"), "utf8");
+    const metadata = JSON.parse(metadataText);
+    assert.equal(metadata.status, "imported");
+    assert.equal(metadata.attempt, 0);
+    assert.equal(metadata.result_saved, false);
+    assert.equal(metadata.queued_mode, null);
+    assert.equal(metadata.queued_at, null);
+    assert.equal(metadata.last_operation_type, imported.lastOperationType);
+    for (const secret of secrets) assert.equal(metadataText.includes(secret), false, "job metadata must not contain credentials");
+  }
+}
+
+async function readProtocolInvocations() {
+  try {
+    const text = await fs.readFile(protocolInvocationsPath, "utf8");
+    return text.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  }
 }
 
 async function assertSourceUnavailable(id, headers, secrets) {

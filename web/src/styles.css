@@ -372,6 +372,7 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .status-badge.email_otp, .status-badge.password, .status-badge.mfa_otp, .status-badge.totp_setup_otp, .status-badge.phone, .status-badge.phone_otp { color: var(--amber); background: var(--amber-soft); }
 .status-badge.queued { color: var(--blue); background: var(--blue-soft); }
+.status-badge.imported { color: #53605b; background: #edf1ef; }
 .status-badge.completed { color: var(--green-strong); background: var(--green-soft); }
 .status-badge.failed { color: var(--danger); background: var(--danger-soft); }
 .status-badge.canceled { color: #69716f; background: #eff1f0; }
