@@ -440,4 +440,44 @@ for (const platform of ["win32", "darwin"]) {
   assert.equal(h.ctx.sessionLoginCredentials.get(h.job.email).totpSecret, oldKey);
 }
 
+for (const platform of ["linux", "win32", "darwin"]) {
+  const h = harness(platform);
+  Object.assign(h.job, h.ctx.newLogoutAllDevicesState(false), h.ctx.newTotpResetState(false), {
+    totpSecret: "", hasTotpCredential: false, totpKnownEnabled: false,
+    resultSaved: true, totpSetupResumesAuthorization: false,
+  });
+  h.ctx.rememberSessionLoginCredentials(h.job.email, { password: h.job.password, totpSecret: "" });
+  h.files.set("result", { version: 1, email: h.job.email, activation_mode: "automatic",
+    activation_succeeded: true, secret: newKey, otpauth_uri: "otpauth://totp/test" });
+  await h.ctx.finishTotpSetup(h.job, 0, null);
+  assert.equal(h.job.totpSecret, newKey);
+  assert.equal(h.job.logoutAllDevicesStatus, "not_requested");
+  assert.equal(h.job.logoutAllDevicesAttemptedAt, null);
+  assert.equal(h.events.some((event) => event?.ack?.ok === true), false);
+
+  if (platform === "linux") {
+    assert.equal(h.job.totpCredentialCommitted, false);
+    assert.equal(h.job.totpRecoveryPending, true, "successful remote activation without durable storage still requires recovery");
+    assert.equal(h.files.has("result"), true, "the only recovery copy must remain available");
+    assert.equal(h.ctx.sessionLoginCredentials.get(h.job.email).totpSecret, "", "remote activation must not masquerade as an accepted memory-only import");
+    await assert.rejects(h.ctx.readAccountSource(h.job), { status: 409 });
+    let wrote = false;
+    await assert.rejects(h.ctx.exportSourceAccounts({ writeHead() { wrote = true; }, end() { wrote = true; } }, [h.job.id]), { status: 409 });
+    assert.equal(wrote, false);
+    await assert.rejects(h.ctx.updateJobCredentials(h.job, { password: h.job.password, totpSecret: newKey }), { status: 409 });
+    assert.equal(h.job.totpRecoveryPending, true, "reimporting the key into memory cannot clear an unpersisted activation");
+    assert.equal(h.job.totpCredentialCommitted, false);
+    assert.equal(h.files.has("result"), true);
+    assert.equal(h.ctx.sessionLoginCredentials.get(h.job.email).totpSecret, "");
+  } else {
+    assert.equal(h.job.totpCredentialCommitted, true);
+    assert.equal(h.job.totpRecoveryPending, false);
+    assert.equal(h.files.has("result"), false);
+    assert.equal((await h.ctx.readAccountSource(h.job)).account.totpSecret, newKey);
+    let payload;
+    await h.ctx.exportSourceAccounts({ writeHead(status) { assert.equal(status, 200); }, end(value) { payload = String(value); } }, [h.job.id]);
+    assert.equal(payload.replace(/^\uFEFF/, "").trim(), `${h.job.email}----test-password----${newKey}`);
+  }
+}
+
 console.log("Console TOTP lifecycle and credential-view/export safety tests passed.");

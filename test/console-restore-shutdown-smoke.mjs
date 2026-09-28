@@ -8,6 +8,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const persistentCredentialsSupported = ["win32", "darwin"].includes(process.platform);
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-restore-"));
 const outputRoot = path.join(tempRoot, "output");
 const restoredId = "11111111-1111-4111-8111-111111111111";
@@ -144,6 +145,7 @@ const child = spawn(process.execPath, [
     ...process.env,
     ONBOARDING_OUTPUT_ROOT: outputRoot,
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-protocol-login.mjs"),
+    LOCALAPPDATA: path.join(tempRoot, "local-app-data"),
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(tempRoot, "credentials"),
     TOSUB2_TLS_PROFILE: "chrome142",
   },
@@ -180,18 +182,47 @@ try {
   assert.equal(recoveredPassword.loginMode, "password");
   assert.equal(recoveredPassword.canAddPassword, false);
   assert.equal(recoveredPassword.canRetry, true);
-  assert.equal(recoveredPassword.passwordAddError, null);
   assert.equal(recoveredPassword.passwordAddedAt, "2026-08-17T05:00:00.000Z");
-  assert.match(recoveredPassword.prompt, /已恢复成功添加的新密码/);
-  await assert.rejects(fs.access(path.join(interruptedPasswordDir, "password-add-result.json")));
+  if (persistentCredentialsSupported) {
+    assert.equal(recoveredPassword.passwordAddError, null);
+    assert.match(recoveredPassword.prompt, /已恢复成功添加的新密码/);
+    await assert.rejects(fs.access(path.join(interruptedPasswordDir, "password-add-result.json")));
+  } else {
+    assert.match(recoveredPassword.passwordAddError, /不支持持久凭据存储/);
+    assert.doesNotMatch(recoveredPassword.prompt, /已恢复成功|安全保存/);
+    const passwordEvidence = JSON.parse(await fs.readFile(path.join(interruptedPasswordDir, "password-add-result.json"), "utf8"));
+    assert.equal(passwordEvidence.password, "Recovered_Test_4826!", "the only password recovery copy must be retained");
+    await assertSourceUnavailable(interruptedPasswordId, headers, [passwordEvidence.password]);
+  }
   const recoveredTotp = page.jobs.find((job) => job.id === interruptedTotpId);
   assert.equal(recoveredTotp.status, "resume_available");
   assert.equal(recoveredTotp.hasTotpKey, true);
   assert.equal(recoveredTotp.canSetupTotp, false);
-  assert.equal(recoveredTotp.canRetry, true);
-  assert.equal(recoveredTotp.totpSetupError, null);
-  assert.match(recoveredTotp.prompt, /已恢复成功激活的 2FA 密钥/);
-  await assert.rejects(fs.access(path.join(interruptedTotpDir, "totp-setup-result.json")));
+  if (persistentCredentialsSupported) {
+    assert.equal(recoveredTotp.canRetry, true);
+    assert.equal(recoveredTotp.totpRecoveryPending, false);
+    assert.equal(recoveredTotp.totpSetupError, null);
+    assert.match(recoveredTotp.prompt, /已恢复成功激活的 2FA 密钥/);
+    await assert.rejects(fs.access(path.join(interruptedTotpDir, "totp-setup-result.json")));
+  } else {
+    assert.equal(recoveredTotp.canRetry, false);
+    assert.equal(recoveredTotp.canForceRelogin, false);
+    assert.equal(recoveredTotp.autoRepairEligible, false);
+    assert.equal(recoveredTotp.totpRecoveryPending, true);
+    assert.match(recoveredTotp.totpSetupError, /不支持持久凭据存储/);
+    assert.doesNotMatch(recoveredTotp.prompt, /已恢复成功|安全保存/);
+    const totpEvidencePath = path.join(interruptedTotpDir, "totp-setup-result.json");
+    const totpEvidence = JSON.parse(await fs.readFile(totpEvidencePath, "utf8"));
+    assert.equal(totpEvidence.activation_succeeded, true);
+    assert.equal(totpEvidence.secret, "NB2W45DFOIZAQWER", "unpersisted activation evidence must remain available");
+    await assertSourceUnavailable(interruptedTotpId, headers, [totpEvidence.secret]);
+    const retry = await fetch(`${baseUrl}/api/jobs/${interruptedTotpId}/retry`, {
+      method: "POST", headers, body: JSON.stringify({}),
+    });
+    assert.equal(retry.status, 409, "pending TOTP recovery must not start another protocol run");
+    assert.match((await retry.json()).error, /2FA 恢复未完成/);
+    assert.deepEqual(JSON.parse(await fs.readFile(totpEvidencePath, "utf8")), totpEvidence, "rejected retry must preserve the recovery result");
+  }
 
   const createResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
@@ -239,6 +270,17 @@ try {
   sub2api.closeAllConnections?.();
   await new Promise((resolve) => sub2api.close(resolve));
   await fs.rm(tempRoot, { recursive: true, force: true });
+}
+
+async function assertSourceUnavailable(id, headers, secrets) {
+  const source = await fetch(`${baseUrl}/api/jobs/${id}/source`, { headers });
+  const exported = await fetch(`${baseUrl}/api/jobs/export-source`, {
+    method: "POST", headers, body: JSON.stringify({ ids: [id] }),
+  });
+  assert.equal(source.status, 409, "restored file contents are not authoritative current credentials");
+  assert.equal(exported.status, 409, "unsafe recovery credentials must not be exported");
+  const errors = (await source.text()) + (await exported.text());
+  for (const secret of secrets) assert.equal(errors.includes(secret), false);
 }
 
 async function waitForJson(url) {

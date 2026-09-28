@@ -8,6 +8,8 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const persistentCredentials = ["win32", "darwin"].includes(process.platform);
+const recoveryJobIds = [];
 const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-console-"));
 const port = await findAvailablePort();
 const baseUrl = `http://127.0.0.1:${port}`;
@@ -134,6 +136,7 @@ const child = spawn(process.execPath, [
     TOSUB2_TLS_PROFILE: "chrome142",
     PROXY_CONNECTION_RETRY_BASE_MS: "1",
     SUB2API_AUTO_REPAIR_COOLDOWN_MS: "0",
+    LOCALAPPDATA: path.join(outputRoot, "test-local-app-data"),
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(outputRoot, "test-mac-credentials"),
   },
   stdio: ["ignore", "pipe", "pipe"],
@@ -246,7 +249,8 @@ try {
   assert.equal(created.created, true);
   assert.equal(created.job.lastOperationType, "initial_authorization");
   assert.ok(Date.parse(created.job.lastOperationAt));
-  const jobId = created.job.id;
+  let jobId = created.job.id;
+  let currentAccountEmail = created.job.email;
 
   let job = await waitForJob(headers, jobId, (value) => value.status === "completed");
   assert.equal(job.canDownload, true);
@@ -278,7 +282,7 @@ try {
   });
   assert.equal(profileResponse.status, 201);
   const profileCreated = await profileResponse.json();
-  const profileJob = await waitForJob(headers, profileCreated.job.id, (value) => value.status === "completed");
+  let profileJob = await waitForJob(headers, profileCreated.job.id, (value) => value.status === "completed");
   assert.equal(profileJob.canDownload, true);
 
   const setupTotpResponse = await fetch(`${baseUrl}/api/jobs/${profileJob.id}/setup-2fa`, {
@@ -317,23 +321,63 @@ try {
     headers,
     body: JSON.stringify({ ids: [jobId] }),
   });
-  assert.equal(updatedSourceResponse.status, 200);
-  assert.equal(
-    (await updatedSourceResponse.text()).replace(/^\uFEFF/, "").trim(),
-    "cross-platform@example.com--------NB2W45DFOIZAQWER",
-  );
+  const updatedSourceText = await updatedSourceResponse.text();
+  assert.equal(updatedSourceResponse.status, persistentCredentials ? 200 : 409, updatedSourceText);
+  if (persistentCredentials) {
+    assert.equal(updatedSourceText.replace(/^\uFEFF/, "").trim(),
+      "cross-platform@example.com--------NB2W45DFOIZAQWER");
+  } else {
+    assert.match(updatedSourceText, /2FA 恢复状态尚未确认/);
+  }
   const reimportUpdatedSourceResponse = await fetch(`${baseUrl}/api/jobs/batch`, {
     method: "POST",
     headers,
     body: JSON.stringify({ text: "cross-platform@example.com--------NB2W45DFOIZAQWER" }),
   });
   const reimportUpdatedSourceText = await reimportUpdatedSourceResponse.text();
-  assert.equal(reimportUpdatedSourceResponse.status, 201, reimportUpdatedSourceText);
-  const reimportUpdatedSource = JSON.parse(reimportUpdatedSourceText);
-  assert.equal(reimportUpdatedSource.jobs[0].email, "cross-platform@example.com");
-  assert.equal(reimportUpdatedSource.created, 0);
-  assert.equal(reimportUpdatedSource.updated, 1);
-  assert.equal(reimportUpdatedSource.jobs[0].hasTotpKey, true);
+  assert.equal(reimportUpdatedSourceResponse.status, persistentCredentials ? 201 : 409, reimportUpdatedSourceText);
+  if (persistentCredentials) {
+    const reimportUpdatedSource = JSON.parse(reimportUpdatedSourceText);
+    assert.equal(reimportUpdatedSource.jobs[0].email, "cross-platform@example.com");
+    assert.equal(reimportUpdatedSource.created, 0);
+    assert.equal(reimportUpdatedSource.updated, 1);
+    assert.equal(reimportUpdatedSource.jobs[0].hasTotpKey, true);
+  } else {
+    assert.match(reimportUpdatedSourceText, /新密钥尚未可靠保存/);
+    recoveryJobIds.push(jobId, profileJob.id);
+    for (const id of recoveryJobIds) {
+      const pending = await waitForJob(headers, id, (value) => value.status === "completed");
+      assert.equal(pending.totpRecoveryPending, true);
+      assert.equal(pending.canForceRelogin, false);
+      assert.equal(pending.logoutAllDevicesStatus, "not_requested");
+      assert.match(pending.totpSetupError, /密钥持久保存未确认/);
+      const source = await fetch(`${baseUrl}/api/jobs/${id}/source`, { headers });
+      assert.equal(source.status, 409, await source.text());
+      const relogin = await fetch(`${baseUrl}/api/jobs/${id}/relogin`, {
+        method: "POST", headers, body: "{}",
+      });
+      assert.equal(relogin.status, 409, await relogin.text());
+      const files = await fs.readdir(path.join(outputRoot, id));
+      assert.ok(files.includes("totp-setup-result.json"), "unpersisted 2FA recovery result must remain");
+    }
+    // Continue unrelated account operations with explicitly imported credentials;
+    // the two unpersisted activation results stay blocked and intact.
+    const readyResponse = await fetch(`${baseUrl}/api/jobs/batch`, {
+      method: "POST", headers, body: JSON.stringify({ text: [
+        "cross-platform-current@example.com--------NB2W45DFOIZAQWER",
+        "account-profile-current@example.com--------NB2W45DFOIZAQWER",
+      ].join("\n") }),
+    });
+    const readyText = await readyResponse.text();
+    assert.equal(readyResponse.status, 201, readyText);
+    const ready = JSON.parse(readyText);
+    assert.equal(ready.created, 2);
+    jobId = ready.jobs[0].id;
+    currentAccountEmail = ready.jobs[0].email;
+    await waitForJob(headers, jobId, (value) => value.status === "completed");
+    profileJob = await waitForJob(headers, ready.jobs[1].id, (value) => value.status === "completed");
+    assert.equal(profileJob.totpRecoveryPending, false);
+  }
 
   const reloginResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/relogin`, {
     method: "POST",
@@ -464,7 +508,8 @@ try {
     (value) => value.status === "completed" && value.passwordAddedAt,
   );
   assert.equal(passwordAddedJob.lastOperationType, "add_password");
-  assert.equal(passwordAddedJob.passwordAddError, null);
+  if (persistentCredentials) assert.equal(passwordAddedJob.passwordAddError, null);
+  else assert.match(passwordAddedJob.passwordAddError, /不支持持久凭据存储.*本次服务运行期间可用/);
   assert.equal(passwordAddedJob.canAddPassword, false);
 
   const passwordSourceResponse = await fetch(`${baseUrl}/api/jobs/export-source`, {
@@ -475,7 +520,7 @@ try {
   const passwordSourceText = await passwordSourceResponse.text();
   assert.equal(passwordSourceResponse.status, 200, passwordSourceText);
   const passwordSourceParts = passwordSourceText.replace(/^\uFEFF/, "").trim().split("----");
-  assert.equal(passwordSourceParts[0], "cross-platform@example.com");
+  assert.equal(passwordSourceParts[0], currentAccountEmail);
   assert.equal(passwordSourceParts[2], "NB2W45DFOIZAQWER");
   assert.equal(passwordSourceParts[1].length, 18);
   assert.match(passwordSourceParts[1], /[a-z]/);
@@ -500,7 +545,8 @@ try {
     profileJob.id,
     (value) => value.status === "completed" && value.passwordAddedAt,
   );
-  assert.equal(profilePasswordAdded.passwordAddError, null);
+  if (persistentCredentials) assert.equal(profilePasswordAdded.passwordAddError, null);
+  else assert.match(profilePasswordAdded.passwordAddError, /不支持持久凭据存储.*本次服务运行期间可用/);
   assert.equal(profilePasswordAdded.canAddPassword, false);
 
   const incompleteAuthorizationResponse = await fetch(`${baseUrl}/api/jobs`, {
@@ -534,7 +580,8 @@ try {
   assert.equal(incompletePasswordAdded.canRetry, true);
   assert.equal(incompletePasswordAdded.canAddPassword, false);
   assert.equal(incompletePasswordAdded.loginMode, "password");
-  assert.match(incompletePasswordAdded.prompt, /可以继续未完成的 Codex 授权/);
+  assert.match(incompletePasswordAdded.prompt, persistentCredentials
+    ? /可以继续未完成的 Codex 授权/ : /密码添加成功，但新密码未能持久保存/);
   const incompletePasswordLogs = await fetch(`${baseUrl}/api/jobs/${incompleteAuthorizationId}/logs`, { headers })
     .then((response) => response.json());
   assert.match(incompletePasswordLogs.logs, /Reusing verified login checkpoint/);
@@ -588,7 +635,8 @@ try {
     (value) => value.status === "resume_available" && value.hasTotpKey,
   );
   assert.equal(incompleteTotpCompleted.canDownload, false);
-  assert.equal(incompleteTotpCompleted.canRetry, true);
+  assert.equal(incompleteTotpCompleted.canRetry, persistentCredentials);
+  assert.equal(incompleteTotpCompleted.totpRecoveryPending, !persistentCredentials);
   assert.equal(incompleteTotpCompleted.canSetupTotp, false);
   assert.match(incompleteTotpCompleted.prompt, /2FA 已设置.*继续未完成的 Codex 授权/);
   const incompleteTotpLogs = await fetch(`${baseUrl}/api/jobs/${incompleteTotpId}/logs`, { headers })
@@ -600,22 +648,29 @@ try {
     headers,
     body: "{}",
   });
-  assert.equal(continueTotpAuthorizationResponse.status, 200, await continueTotpAuthorizationResponse.text());
-  await waitForJob(headers, incompleteTotpId, (value) => value.status === "phone");
-  const continuedTotpPhoneResponse = await fetch(`${baseUrl}/api/jobs/${incompleteTotpId}/input`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ action: "phone", value: "+60123450001" }),
-  });
-  assert.equal(continuedTotpPhoneResponse.status, 200, await continuedTotpPhoneResponse.text());
-  await waitForJob(headers, incompleteTotpId, (value) => value.status === "phone_otp");
-  const continuedTotpPhoneOtpResponse = await fetch(`${baseUrl}/api/jobs/${incompleteTotpId}/input`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ action: "phone_otp", value: "123456" }),
-  });
-  assert.equal(continuedTotpPhoneOtpResponse.status, 200, await continuedTotpPhoneOtpResponse.text());
-  await waitForJob(headers, incompleteTotpId, (value) => value.status === "completed");
+  const continueTotpText = await continueTotpAuthorizationResponse.text();
+  assert.equal(continueTotpAuthorizationResponse.status, persistentCredentials ? 200 : 409, continueTotpText);
+  if (persistentCredentials) {
+    await waitForJob(headers, incompleteTotpId, (value) => value.status === "phone");
+    const continuedTotpPhoneResponse = await fetch(`${baseUrl}/api/jobs/${incompleteTotpId}/input`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ action: "phone", value: "+60123450001" }),
+    });
+    assert.equal(continuedTotpPhoneResponse.status, 200, await continuedTotpPhoneResponse.text());
+    await waitForJob(headers, incompleteTotpId, (value) => value.status === "phone_otp");
+    const continuedTotpPhoneOtpResponse = await fetch(`${baseUrl}/api/jobs/${incompleteTotpId}/input`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ action: "phone_otp", value: "123456" }),
+    });
+    assert.equal(continuedTotpPhoneOtpResponse.status, 200, await continuedTotpPhoneOtpResponse.text());
+    await waitForJob(headers, incompleteTotpId, (value) => value.status === "completed");
+  } else {
+    assert.match(continueTotpText, /恢复未完成|恢复结果/);
+    assert.equal((await waitForJob(headers, incompleteTotpId,
+      (value) => value.status === "resume_available")).totpRecoveryPending, true);
+  }
 
   const groupsResponse = await fetch(`${baseUrl}/api/sub2api/options`, {
     method: "POST",
@@ -663,7 +718,7 @@ try {
   assert.equal(uploadedAccounts[0].schedulable, true);
   assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "full");
   assert.deepEqual(uploadedAccounts[0].credentials.model_mapping, { "gpt-5": "gpt-5", "gpt-5-mini": "gpt-5-mini" });
-  assert.equal(uploadedAccounts[0].credentials.email, "account-profile@example.com");
+  assert.equal(uploadedAccounts[0].credentials.email, profileJob.email);
 
   const legacyUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
     method: "POST",
@@ -1040,6 +1095,7 @@ try {
     body: JSON.stringify({ ids: [
       jobId,
       profileJob.id,
+      ...recoveryJobIds,
       mfaPromptJobId,
       wrongEmailOtpJobId,
       ...batch.jobs.map((item) => item.id),
@@ -1059,7 +1115,7 @@ try {
     throw new Error(`delete request failed with HTTP ${deleteResponse.status}: ${await deleteResponse.text()}`);
   }
   const deleted = await deleteResponse.json();
-  assert.equal(deleted.deleted, 27);
+  assert.equal(deleted.deleted, 27 + recoveryJobIds.length);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);
